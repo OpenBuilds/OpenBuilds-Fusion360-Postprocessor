@@ -39,8 +39,9 @@ Changelog
 26 Jan 2021 - V1.0.25 : Plasma pierce height, and probe
 29 Aug 2021 - V1.0.26 : Regroup properties for display, Z height check options
 03 Sep 2021 - V1.0.27 : Fix arc ramps not changing Z when they should have
+12 Nov 2021 - V1.0.28 : Added property group names (sharmstr)
 */
-obversion = 'V1.0.27';
+obversion = 'V1.0.28';
 description = "OpenBuilds CNC : GRBL/BlackBox";  // cannot have brackets in comments
 vendor = "OpenBuilds";
 vendorUrl = "https://openbuilds.com";
@@ -95,9 +96,27 @@ properties =
 
 // user-defined property definitions - note, do not skip any group numbers
 propertyDefinitions = {
+    machineVendor: {
+      group: "1: Machine",
+      title:"Machine Vendor",
+      description: "Machine vendor defined here will be displayed in header if machine config not set.",
+      type:"string",
+   },
+   machineModel: {
+      group: "1: Machine",
+      title:"Machine Model",
+      description: "Machine model defined here will be displayed in header if machine config not set.",
+      type:"string",
+   },
+   machineControl: {
+      group: "1: Machine",
+      title:"Machine Control",
+      description: "Machine control defined here will be displayed in header if machine config not set.",
+      type:"string",
+    }
    routerType:  {
-      group: 1,
-      title: "SPINDLE: Spindle/Router type",
+      group: "2: Spindle",
+      title: "Spindle/Router type",
       description: "Select the type of spindle you have.",
       type: "enum",
       values:[
@@ -108,100 +127,82 @@ propertyDefinitions = {
       ]
    },
    spindleTwoDirections:  {
-      group: 1,
-      title: "SPINDLE: Spindle can rotate clockwise and counterclockwise?",
+      group: "2: Spindle",
+      title: "Spindle can rotate clockwise and counterclockwise?",
       description:  "Yes : spindle can rotate clockwise and counterclockwise, will send M3 and M4. No : spindle can only go clockwise, will only send M3",
       type: "boolean",
     },
     spindleOnOffDelay:  {
-      group: 1,
-      title: "SPINDLE: Spindle on/off delay",
+      group: "2: Spindle",
+      title: "Spindle on/off delay",
       description: "Time (in seconds) the spindle needs to get up to speed or stop, also used for plasma pierce delay",
       type: "number",
     },
     hasCoolant:  {
-      group: 1,
-      title: "SPINDLE: Has coolant?",
+      group: "2: Spindle",
+      title: "Has coolant?",
       description: "Yes: machine uses the coolant output, M8 M9 will be sent. No : coolant output not connected, so no M8 M9 will be sent",
       type: "boolean",
     },
     checkFeed:  {
-      group: 2,
-      title: "SAFETY: Check tool feedrate",
+      group: "3: Safety",
+      title: "Check tool feedrate",
       description: "Feedrate to be used for the tool length check, always millimeters.",
       type: "spatial",
     },
     checkZ:  {
-      group: 2,
-      title: "SAFETY: Check tool Z length?",
+      group: "3: Safety",
+      title: "Check tool Z length?",
       description: "Insert a safe move and program pause M0 to check for tool length, tool will lower to clearanceHeight set in the Heights tab.",
       type: "boolean",
     },
 
    generateMultiple: {
-      group: 3,
-      title:"TOOLCHANGE: Generate muliple files for tool changes?",
+      group: "4: Tool Changes",
+      title:"Generate muliple files for tool changes?",
       description: "Generate multiple files. One for each tool change.",
       type:"boolean",
     },
 
-
    gotoMCSatend: {
-      group: 4,
-      title:"JOBEND: Use Machine Coordinates (G53) at end of job?",
+      group: "5: Job Start Z and Job End X,Y,Z Coordinates",
+      title:"Use Machine Coordinates (G53) at end of job?",
       description: "Yes will do G53 G0 x{machinehomeX} y(machinehomeY) (Machine Coordinates), No will do G0 x(machinehomeX) y(machinehomeY) (Work Coordinates) at end of program",
       type:"boolean",
    },
    machineHomeX: {
-      group: 4,
-      title:"JOBEND: End of job X position (MM).",
+      group: "5: Job Start Z and Job End X,Y,Z Coordinates",
+      title:"End of job X position (MM).",
       description: "(G53 or G54) X position to move to in Millimeters",
       type:"spatial",
    },
    machineHomeY: {
-      group: 4,
-      title:"JOBEND: End of job Y position (MM).",
+      group: "5: Job Start Z and Job End X,Y,Z Coordinates",
+      title:"End of job Y position (MM).",
       description: "(G53 or G54) Y position to move to in Millimeters.",
       type:"spatial",
    },
    machineHomeZ: {
-      group: 4,
-      title:"JOBEND: START and End of job Z position (MCS Only) (MM)",
+      group: "5: Job Start Z and Job End X,Y,Z Coordinates",
+      title:"Start and End of job Z position (MCS Only) (MM)",
       description: "G53 Z position to move to in Millimeters, normally negative.  Moves to this distance below Z home.",
       type:"spatial",
    },
 
-
    linearizeSmallArcs: {
-      group: 5,
-      title:"ARCS: Linearize Small Arcs",
+      group: "6: Arcs",
+      title:"Linearize Small Arcs",
       description: "Arcs with radius < toolRadius can have mismatched radii, set this to Yes to linearize them. This solves G2/G3 radius mismatch errors.",
       type:"boolean",
    },
    
-   PowerVaporise: {title:"LASER: Power for Vaporizing", description:"Scary power VAPORIZE power setting, in percent.", group:6, type:"integer"},
-   PowerThrough:  {title:"LASER: Power for Through Cutting", description:"Normal Through cutting power, in percent.", group:6, type:"integer"},
-   PowerEtch:     {title:"LASER: Power for Etching", description:"Just enough power to Etch the surface, in percent.", group:6, type:"integer"},
-   UseZ:          {title:"LASER: Use Z motions at start and end.", description:"Use True if you have a laser on a router with Z motion, or a PLASMA cutter.", group:6, type:"boolean"}, 
-   plasma_usetouchoff:  {title:"PLASMA: Use Z touchoff probe routine", description:"Set to true if have a touchoff probe for Plasma.", group:6, type:"boolean"}, 
-   plasma_touchoffOffset:{title:"PLASMA: Plasma touch probe offset", description:"Offset in Z at which the probe triggers, always Millimeters, always positive.", group:6, type:"spatial"},
-
-   machineVendor: {
-      title:"Machine Vendor",
-      description: "Machine vendor defined here will be displayed in header if machine config not set.",
-      type:"string",
-   },
-   machineModel: {
-      title:"Machine Model",
-      description: "Machine model defined here will be displayed in header if machine config not set.",
-      type:"string",
-   },
-   machineControl: {
-      title:"Machine Control",
-      description: "Machine control defined here will be displayed in header if machine config not set.",
-      type:"string",
-    }
-};
+   PowerVaporise: {title:"Power for Vaporizing", description:"Scary power VAPORIZE power setting, in percent.", group:"7: Laser / Plasma Settings", type:"integer"},
+   PowerThrough:  {title:"Power for Through Cutting", description:"Normal Through cutting power, in percent.", group:"7: Laser / Plasma Settings", type:"integer"},
+   PowerEtch:     {title:"Power for Etching", description:"Just enough power to Etch the surface, in percent.", group:"7: Laser / Plasma Settings", type:"integer"},
+   UseZ:          {title:"Use Z motions at start and end.", description:"Use True if you have a laser on a router with Z motion, or a PLASMA cutter.", group:"7: Laser / Plasma Settings", type:"boolean"}, 
+   plasma_usetouchoff:  {title:"Use Z touchoff probe routine", description:"Set to true if have a touchoff probe for Plasma.", group:"7: Laser / Plasma Settings", type:"boolean"}, 
+   plasma_touchoffOffset:{title:"Plasma touch probe offset", description:"Offset in Z at which the probe triggers, always Millimeters, always positive.", group:"7: Laser / Plasma Settings", type:"spatial"}
+ };
 
 // USER ADJUSTMENTS FOR PLASMA
 plasma_probedistance = 30;   // distance to probe down in Z, always in millimeters
