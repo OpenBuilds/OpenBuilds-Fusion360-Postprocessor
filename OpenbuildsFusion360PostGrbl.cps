@@ -113,7 +113,7 @@ propertyDefinitions = {
       title:"Machine Control",
       description: "Machine control defined here will be displayed in header if machine config not set.",
       type:"string",
-    }
+   },
    routerType:  {
       group: "2: Spindle",
       title: "Spindle/Router type",
