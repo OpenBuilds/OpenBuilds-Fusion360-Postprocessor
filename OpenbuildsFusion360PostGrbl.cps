@@ -94,28 +94,49 @@ properties =
    checkFeed : 200    // always MM/min
 };
 
-// user-defined property definitions - note, do not skip any group numbers
+// property groups
+groupDefinitions = {
+    //postInfo: {title: "OpenBuilds Post Documentation: https://docs.openbuilds.com/doku.php", description: "", order: 0},
+    machine: {title: "Machine", description: "Machine options", order: 1},
+    spindle: {title: "Spindle", description: "Spindle options", order: 2},
+    safety: {title: "Safety", description: "Safety options", order: 3},
+    toolChange: {title: "Tool Changes", description: "Tool change options", order: 4},
+    startEndPos: {title: "Job Start Z and Job End X,Y,Z Coordinates", description: "Set the spindle start and end position", order: 5},
+    arcs: {title: "Arcs", description: "Arc options", order: 6},
+    laserPlasma: {title: "Laser / Plasma", description: "Laser / Plasma options", order: 7}
+
+};
+
+// user-defined property definitions
 propertyDefinitions = {
+/*
+    postProcessorDocs: {
+        group: "postInfo",
+        title: "Copy and paste linke to docs",
+        description: "Link to docs",
+        type: "string",
+    },
+*/
     machineVendor: {
-      group: "1: Machine",
+      group: "machine",
       title:"Machine Vendor",
       description: "Machine vendor defined here will be displayed in header if machine config not set.",
       type:"string",
    },
    machineModel: {
-      group: "1: Machine",
+      group: "machine",
       title:"Machine Model",
       description: "Machine model defined here will be displayed in header if machine config not set.",
       type:"string",
    },
    machineControl: {
-      group: "1: Machine",
+      group: "machine",
       title:"Machine Control",
       description: "Machine control defined here will be displayed in header if machine config not set.",
       type:"string",
    },
    routerType:  {
-      group: "2: Spindle",
+      group: "spindle",
       title: "Spindle/Router type",
       description: "Select the type of spindle you have.",
       type: "enum",
@@ -127,81 +148,81 @@ propertyDefinitions = {
       ]
    },
    spindleTwoDirections:  {
-      group: "2: Spindle",
+      group: "spindle",
       title: "Spindle can rotate clockwise and counterclockwise?",
       description:  "Yes : spindle can rotate clockwise and counterclockwise, will send M3 and M4. No : spindle can only go clockwise, will only send M3",
       type: "boolean",
     },
     spindleOnOffDelay:  {
-      group: "2: Spindle",
+      group: "spindle",
       title: "Spindle on/off delay",
       description: "Time (in seconds) the spindle needs to get up to speed or stop, also used for plasma pierce delay",
       type: "number",
     },
     hasCoolant:  {
-      group: "2: Spindle",
+      group: "spindle",
       title: "Has coolant?",
       description: "Yes: machine uses the coolant output, M8 M9 will be sent. No : coolant output not connected, so no M8 M9 will be sent",
       type: "boolean",
     },
     checkFeed:  {
-      group: "3: Safety",
+      group: "safety",
       title: "Check tool feedrate",
       description: "Feedrate to be used for the tool length check, always millimeters.",
       type: "spatial",
     },
     checkZ:  {
-      group: "3: Safety",
+      group: "safety",
       title: "Check tool Z length?",
       description: "Insert a safe move and program pause M0 to check for tool length, tool will lower to clearanceHeight set in the Heights tab.",
       type: "boolean",
     },
 
-   generateMultiple: {
-      group: "4: Tool Changes",
+    generateMultiple: {
+      group: "toolChange",
       title:"Generate muliple files for tool changes?",
       description: "Generate multiple files. One for each tool change.",
       type:"boolean",
     },
 
-   gotoMCSatend: {
-      group: "5: Job Start Z and Job End X,Y,Z Coordinates",
+    gotoMCSatend: {
+      group: "startEndPos",
       title:"Use Machine Coordinates (G53) at end of job?",
       description: "Yes will do G53 G0 x{machinehomeX} y(machinehomeY) (Machine Coordinates), No will do G0 x(machinehomeX) y(machinehomeY) (Work Coordinates) at end of program",
       type:"boolean",
    },
    machineHomeX: {
-      group: "5: Job Start Z and Job End X,Y,Z Coordinates",
+      group: "startEndPos",
       title:"End of job X position (MM).",
       description: "(G53 or G54) X position to move to in Millimeters",
       type:"spatial",
    },
    machineHomeY: {
-      group: "5: Job Start Z and Job End X,Y,Z Coordinates",
+      group: "startEndPos",
       title:"End of job Y position (MM).",
       description: "(G53 or G54) Y position to move to in Millimeters.",
       type:"spatial",
    },
    machineHomeZ: {
-      group: "5: Job Start Z and Job End X,Y,Z Coordinates",
+      group: "startEndPos",
       title:"Start and End of job Z position (MCS Only) (MM)",
       description: "G53 Z position to move to in Millimeters, normally negative.  Moves to this distance below Z home.",
       type:"spatial",
    },
 
    linearizeSmallArcs: {
-      group: "6: Arcs",
+      group: "arcs",
       title:"Linearize Small Arcs",
       description: "Arcs with radius < toolRadius can have mismatched radii, set this to Yes to linearize them. This solves G2/G3 radius mismatch errors.",
       type:"boolean",
    },
    
-   PowerVaporise: {title:"Power for Vaporizing", description:"Scary power VAPORIZE power setting, in percent.", group:"7: Laser / Plasma Settings", type:"integer"},
-   PowerThrough:  {title:"Power for Through Cutting", description:"Normal Through cutting power, in percent.", group:"7: Laser / Plasma Settings", type:"integer"},
-   PowerEtch:     {title:"Power for Etching", description:"Just enough power to Etch the surface, in percent.", group:"7: Laser / Plasma Settings", type:"integer"},
-   UseZ:          {title:"Use Z motions at start and end.", description:"Use True if you have a laser on a router with Z motion, or a PLASMA cutter.", group:"7: Laser / Plasma Settings", type:"boolean"}, 
-   plasma_usetouchoff:  {title:"Use Z touchoff probe routine", description:"Set to true if have a touchoff probe for Plasma.", group:"7: Laser / Plasma Settings", type:"boolean"}, 
-   plasma_touchoffOffset:{title:"Plasma touch probe offset", description:"Offset in Z at which the probe triggers, always Millimeters, always positive.", group:"7: Laser / Plasma Settings", type:"spatial"}
+   PowerVaporise: {title:"Power for Vaporizing", description:"Scary power VAPORIZE power setting, in percent.", group:"laserPlasma", type:"integer",},
+   PowerThrough:  {title:"Power for Through Cutting", description:"Normal Through cutting power, in percent.", group:"laserPlasma", type:"integer",},
+   PowerEtch:     {title:"Power for Etching", description:"Just enough power to Etch the surface, in percent.", group:"laserPlasma", type:"integer",},
+   UseZ:          {title:"Use Z motions at start and end.", description:"Use True if you have a laser on a router with Z motion, or a PLASMA cutter.", group:"laserPlasma", type:"boolean",}, 
+   plasma_usetouchoff:  {title:"Use Z touchoff probe routine", description:"Set to true if have a touchoff probe for Plasma.", group:"laserPlasma", type:"boolean",}, 
+   plasma_touchoffOffset:{title:"Plasma touch probe offset", description:"Offset in Z at which the probe triggers, always Millimeters, always positive.", group:"laserPlasma", type:"spatial",}
  };
 
 // USER ADJUSTMENTS FOR PLASMA
