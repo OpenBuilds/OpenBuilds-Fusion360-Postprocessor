@@ -41,7 +41,6 @@ Changelog
 12 Nov 2021 - V1.0.28 : Added property group names, fixed default router selection, now uses permittedCommentChars  (sharmstr)
 24 Nov 2021 - V1.0.28 : Improved coolant selection, tweaked property groups, tweaked G53 generation, links for help in comments.
 21 Feb 2022 - V1.0.29 : Fix sideeffects of drill operation having rapids even when in noRapid mode by always resetting haveRapid in onSection
-
 */
 obversion = 'V1.0.29';
 description = "OpenBuilds CNC : GRBL/BlackBox";  // cannot have brackets in comments
