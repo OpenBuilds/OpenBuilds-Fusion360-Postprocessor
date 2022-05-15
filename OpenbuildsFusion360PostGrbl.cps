@@ -41,7 +41,7 @@ Changelog
 12 Nov 2021 - V1.0.28 : Added property group names, fixed default router selection, now uses permittedCommentChars  (sharmstr)
 24 Nov 2021 - V1.0.28 : Improved coolant selection, tweaked property groups, tweaked G53 generation, links for help in comments.
 21 Feb 2022 - V1.0.29 : Fix sideeffects of drill operation having rapids even when in noRapid mode by always resetting haveRapid in onSection
-10 May 2022 - V1.0.30 : Change naming convention for first file in multifile output
+15 May 2022 - V1.0.30 : Change naming convention for first file in multifile output
 */
 obversion = 'V1.0.30';
 description = "OpenBuilds CNC : GRBL/BlackBox";  // cannot have brackets in comments
@@ -1275,13 +1275,22 @@ function onClose()
 
 function onTerminate()
    {
-   // If we are generating multiple files, then rename first file to add # of #
-   // If you dont want to show the log file, then untick "open in Open file in NC editor"
+   // If we are generating multiple files, copy first file to add # of #
+   // Then remove first file and recreate with file list
    if (filesToGenerate > 1) {
-     var fileIndexFormat = createFormat({ width: 2, zeropad: true, decimals: 0 });
-     var newOutput = FileSystem.replaceExtension(getOutputPath(), fileIndexFormat.format(1) + 'of' + filesToGenerate + '.' + extension);
-     FileSystem.moveFile(getOutputPath(), newOutput);
-     executeNoWait(newOutput, '', false, '');
+    var outputPath = getOutputPath();
+    var outputFolder = FileSystem.getFolderPath(getOutputPath());
+    var programFilename = FileSystem.getFilename(outputPath);
+    var newOutput = FileSystem.replaceExtension(getOutputPath(), fileIndexFormat.format(1) + 'of' + filesToGenerate + '.' + extension);
+    executeNoWait(newOutput, '', false, '');
+    FileSystem.remove(outputPath);
+
+    var file = new TextFile(outputFolder + "\\" + programFilename, true, "ansi");
+    file.writeln("The following gcode files were created: ");
+    for (var i = 0; i < filesToGenerate; ++i) {
+      file.writeln(programName + '.' + fileIndexFormat.format(i + 1) + 'of' + filesToGenerate + '.' + extension);
+    }
+    file.close();     
     }
    }
 
