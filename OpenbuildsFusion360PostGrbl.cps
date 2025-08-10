@@ -55,14 +55,15 @@
    27 Mar 2024 - V1.0.41 : replace 'power' with OB.power (and friends) because postprocessor.power now exists and is readonly
    30 Mar 2024 - V1.0.42 : postprocessor.alert() method has disappeared - replaced with warning(msg) and writeComment(msg), moved more stuff into OB. and SPL.
    xx Oct 2024 - V1.0.43 : fix plasma pierce/cut height, pierceTime so it uses the tool settings if provided
+   10 Aug 2025 - V1.0.44 : fix movement ordering and other tweaks, see readme.md
 */
-obversion = 'V1.0.43';
+obversion = 'V1.0.44';
 description = "OpenBuilds CNC : GRBL/BlackBox";  // cannot have brackets in comments
 longDescription = description + " : Post " + obversion; // adds description to post library dialog box
 vendor = "OpenBuilds";
 vendorUrl = "https://openbuilds.com";
 model = "GRBL";
-legal = "Copyright Openbuilds 2024";
+legal = "Copyright Openbuilds 2025";
 certificationLevel = 2;
 minimumRevision = 45892;
 
@@ -331,7 +332,8 @@ var OB = {
    isPlasma : false,    // set true for plasma
    cutmode :  0,        // M3 or M4
    cuttingMode : 'none',  // set by onParameter for laser/plasma
-   haveRapid : false    // assume no rapid moves
+   haveRapid : false,   // assume no rapid moves
+   movestr : 'unknown'  // movement type string for comments
 }
 
 var plasma = {
@@ -392,7 +394,7 @@ function activateMachine() {
   // save multi-axis feedrate settings from machine configuration
   var mode = machineConfiguration.getMultiAxisFeedrateMode();
   var type = mode == FEED_INVERSE_TIME ? machineConfiguration.getMultiAxisFeedrateInverseTimeUnits() :
-    (mode == FEED_DPM ? machineConfiguration.getMultiAxisFeedrateDPMType() : DPM_STANDARD);
+      (mode == FEED_DPM ? machineConfiguration.getMultiAxisFeedrateDPMType() : DPM_STANDARD);
   multiAxisFeedrate = {
     mode     : mode,
     maximum  : machineConfiguration.getMultiAxisFeedrateMaximum(),
@@ -1302,13 +1304,20 @@ function onSection()
       else
          if (tool.clockwise)
             {
-            s = sOutput.format(tool.spindleRPM);
             var rpmChanged = false;
-            if (s)
+            if ( (sOutput.getCurrent() != Infinity) && rpmFormat.areDifferent(tool.spindleRPM, sOutput.getCurrent()) )
                {
-               rpmChanged = !mFormat.areDifferent(3, mOutput.getCurrent() );
-               mOutput.reset();  // always output M3 if speed changes - helps with resume
+               s = sOutput.format(tool.spindleRPM);
+               rpmChanged = true;
+               mOutput.reset();
                }
+            else
+               s = sOutput.format(tool.spindleRPM);
+            //if (s)
+            //   {
+            //   rpmChanged = !mFormat.areDifferent(3, mOutput.getCurrent() );
+            //   mOutput.reset();  // always output M3 if speed changes - helps with resume
+            //   }
             m = mOutput.format(3);
             writeBlock(m, s, clnt);
             if (rpmChanged) // means a speed change, spindle was already on, delay half the time
@@ -1369,8 +1378,20 @@ function onDwell(seconds)
 
 function onSpindleSpeed(spindleSpeed)
    {
-   writeBlock(sOutput.format(spindleSpeed));
-   gMotionModal.reset(); // force a G word after a spindle speed change to keep CONTROL happy
+   if ( rpmFormat.areDifferent(spindleSpeed, sOutput.getCurrent()) )
+      {
+      var mv = mOutput.getCurrent();   
+      mOutput.reset();  // always output the M word, makes it easier to read
+      writeBlock(mOutput.format(mv), sOutput.format(spindleSpeed), ' ; ' , OB.movestr);
+      gMotionModal.reset(); // force a G word after a spindle speed change to keep CONTROL happy
+      }
+   }
+
+/// store the movement type for comments
+function onMovement(movement) 
+   {
+   var jet = tool.isJetTool && tool.isJetTool();
+   OB.movestr = getMovementStringId(movement, jet);
    }
 
 function onRadiusCompensation()
@@ -1387,8 +1408,9 @@ function onRadiusCompensation()
 
 function onRapid(_x, _y, _z)
    {
+   if (debugMode) writeComment("onRapid " + OB.haveRapid);      
    OB.haveRapid = true;
-   if (debugMode) writeComment("onRapid");
+   //if (debugMode) writeComment("onRapid");
    if (!OB.isLaser && !OB.isPlasma)
       {
       var x = xOutput.format(_x);
@@ -1397,7 +1419,7 @@ function onRapid(_x, _y, _z)
 
       if (x || y || z)
          {
-         writeBlock(gMotionModal.format(0), x, y, z);
+         writeBlock(gMotionModal.format(0), x, y, z, " ; real rapid");
          feedOutput.reset();
          }
       }
@@ -1423,6 +1445,14 @@ function onRapid(_x, _y, _z)
       if (x || y || z)
          writeBlock(gMotionModal.format(0), x, y, z);
       }
+   // split file here   
+   if (SPL.linecnt > SPL.tapelines)   
+      {
+      if (debugMode) writeComment('Rapid Tapelines ' + SPL.tapelines);
+      SPL.linecnt = 0;
+      var maxfeedrate = getSection( getCurrentSectionId() ).getMaximumFeedrate();      
+      splitHere(_x,_y,_z,maxfeedrate);
+      }
    }
 
 function onLinear(_x, _y, _z, feed)
@@ -1443,13 +1473,20 @@ function onLinear(_x, _y, _z, feed)
       if (x || y || z)
          {
          linmove = 1;          // have to have a default!
-         if (!OB.haveRapid && z)  // if z is changing
+         if (!OB.haveRapid) 
             {
-            if (_z < retractHeight) // compare it to retractHeight, below that is G1, >= is G0
+            // always check height, not only when Z changes as it was previously, Fusion changed the order of movements for personal use   
+            // pointed out by zdima on github, thanks
+            if (_z < retractHeight)    // compare it to retractHeight, below that is G1, >= is G0
                linmove = 1;
             else
+               {
                linmove = 0;
-            if (debugMode && (linmove == 0)) writeComment("NOrapid");
+               gMotionModal.reset();   // force, always have G0 on every G0 line
+               feedOutput.reset();     // force feed on next G1 line
+               f = '';                 // no feed on rapid  moves
+               if (debugMode) writeComment("NOrapid");
+               }
             }
          writeBlock(gMotionModal.format(linmove), x, y, z, f);
          }
@@ -1477,37 +1514,29 @@ function onLinear(_x, _y, _z, feed)
           //  z = 'z0';
          if (debugMode && z != "")            writeComment("onlinear z = " + z);
          var s = sOutput.format(OB.power);
-         if (OB.haveRapid)
+            // laser/plasma does some odd routing that should be rapid if power is off
+            // this is the new process when we dont have onRapid but GRBL requires G0 moves for noncutting laser moves
+         if (OB.powerOn)
             {
-            // this is the old process when we have rapids inserted by onRapid
-            if (!OB.powerOn) // laser/plasma does some odd routing that should be rapid
-               {
-               writeBlock(gMotionModal.format(0), x, y, z, s);
-               feedOutput.reset();
-               }
-            else
-               writeBlock(gMotionModal.format(1), x, y, z, f, s);
+            linmove = 1;
+            writeBlock(gMotionModal.format(1), x, y, z, f, s);
             }
          else
             {
-            // this is the new process when we dont have onRapid but GRBL requires G0 moves for noncutting laser moves
-            if (OB.powerOn)
-               writeBlock(gMotionModal.format(1), x, y, z, f, s);
-            else
-               {
-               writeBlock(gMotionModal.format(0), x, y, z,  s);
-               feedOutput.reset();
-               }
+            linmove = 0;
+            writeBlock(gMotionModal.format(0), x, y, z,  s);
+            feedOutput.reset();
             }
-
          }
       }
-   if (SPL.linecnt > SPL.tapelines)   
-      {
-      if (debugMode) writeComment('Tapelines ' + SPL.tapelines);
-      SPL.linecnt = 0;
-      splitHere(_x,_y,_z,feed);
-      }
+   // TODO move this to onRapid?   somehow we want to split on rapid moves not the middle of a cut, but there may be no rapids....
+   if (!OB.haveRapid && (linmove == 0) )
+      if (SPL.linecnt > SPL.tapelines)   
+         {
+         if (debugMode) writeComment('Tapelines ' + SPL.tapelines);
+         SPL.linecnt = 0;
+         splitHere(_x,_y,_z,feed);
+         }
    }
 
 function onRapid5D(_x, _y, _z, _a, _b, _c)
@@ -1711,16 +1740,19 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed)
    var r2 = Vector.diff(end, center).length;
    if ( (r1 != r2) && (r1 < toolRadius) ) // always recenter small arcs
       {
-      var diff = r1 - r2;
-      var pdiff = Math.abs(diff / r1 * 100);
-      // if percentage difference too great
-      if (pdiff > 0.01)
+      if (debugMode)   
          {
+         var diff = r1 - r2;
+         var pdiff = Math.abs(diff / r1 * 100);
+         }
+      // if percentage difference too great
+      //if (pdiff > 0.01)   1% is too much, arc with diff of 0.68% fails GRBL test
+      //   {
          if (debugMode)  writeComment("recenter");
          // adjust center to make radii equal
          if (debugMode) writeComment("r1 " + r1 + " r2 " + r2 + " d " + (r1 - r2) + " pdiff " + pdiff );
          center = ReCenter(start, end, center, (r1 + r2) /2, cp);
-         }
+      //   }
       }
 
    // arcs smaller than bitradius always have significant radius errors, 
@@ -1728,10 +1760,11 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed)
    // note that larger arcs still have radius errors, but they are a much smaller percentage of the radius
    // and GRBL won't care
    var rad = Vector.diff(start,center).length;  // radius to NEW Center if it has been calculated
-   if ( (rad < toPreciseUnit(2, MM)) || OB.isPlasma)  // only for small arcs, dont need to linearize a 24mm arc on a 50mm tool
+   //TODO change this to always recenter for rad < toolRadius and toolDiam < 3/8", seems these conditions are too lax
+   if ( (rad < toPreciseUnit(6, MM)) || OB.isPlasma)  // only for small arcs, dont need to linearize a 24mm arc on a 50mm tool
       if (properties.linearizeSmallArcs && (rad < toolRadius))
          {
-         var tt = OB.powerOn ? tolerance : tolerance * 20;
+         var tt = OB.powerOn ? tolerance : tolerance * 20; // if power is off on plasma then we are doing rapid motion and a very rough toolpath is fine
          if (debugMode) writeComment("linearizing arc radius " + round(rad, 4) + " toolRadius " + round(toolRadius, 3) + " tolerance " + tt);
          linearize(tt);
          if (debugMode) writeComment("done");
@@ -1802,6 +1835,7 @@ function splitHere(_x,_y,_z,_f)
    // goto x,y
    writeComment("Resume previous position");
    invokeOnRapid(_x,_y,retractHeight);
+   haveRapid = false; // since we have faked a rapid move do not assume we have rapids for all other moves
    // goto z
    var sectionId = getCurrentSectionId();       // what is the number of this operation (starts from 0)
    var section = getSection(sectionId);         // what is the section-object for this operation
@@ -2418,10 +2452,12 @@ function onCyclePoint(x, y, z)
          writeBlock(gMotionModal.format(0), yOutput.format(cycle.probeClearance));
          probeX(x,cycle.probeClearance,z);
          invokeOnRapid(x,y,z);
+         haveRapid = false;
          // position for Y probe
          writeBlock(gMotionModal.format(0), xOutput.format(cycle.probeClearance));
          probeY(cycle.probeClearance,y,z);
          invokeOnRapid(x,y,cycle.clearance);
+         haveRapid = false;
          writeComment("probing-xy-outer-corner complete");
          break;
       case "probing-xy-circular-boss":
@@ -2499,7 +2535,7 @@ function onCyclePoint(x, y, z)
          writeBlock(gMotionModal.format(0), hret);    // G0 to retractheight
          writeBlock(gMotionModal.format(1),_z,feed);  // G1 to drill depth
          if (cycle.dwell > 0)
-            writeBlock(gFormat.format(4), dwell);     // dwell
+            onDwell(cycle.dwell);
          writeBlock(gMotionModal.format(0), hclr);    // G0 to clearance height
          break;
       default:

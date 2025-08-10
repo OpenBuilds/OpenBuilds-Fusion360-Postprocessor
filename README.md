@@ -3,6 +3,17 @@
 Creates .gcode files optimized for GRBL/grblHAL based Openbuilds-style machines.
 Supports router, laser and plasma operations.
 
+V1.0.44
+1. Fix movement ordering as suggested by zdima, Fusion360 has changed the order in which it outputs Z retracts causing some movements to
+   be G1 when they should be G0.
+1. Always output the M code when spindle speed changes.
+1. Use onMovement event to track movement type.
+1. Tag rapid movements with a comment
+1. Split file on line count on a rapid move if possible.
+1. Streamline laser/plasma logic for detecting rapid cut avoidance moves.
+1. Recenter small arcs always, ignoring the percentage difference in start/end radii.
+1. Reset haveRapid after invokeRapid calls to avoid false positives.
+
 V1.0.43
 1. Plasma: if tool setting for pierceTime is set AND spindleonoffdelay is 0 then tool.pierceTime will be used.
 1. Plasma: if tool setting for PierceHeight is set and pierceHeightoverride is false then tool value will be used.
