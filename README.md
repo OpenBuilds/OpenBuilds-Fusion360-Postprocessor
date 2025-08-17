@@ -3,6 +3,13 @@
 Creates .gcode files optimized for GRBL/grblHAL based Openbuilds-style machines.
 Supports router, laser and plasma operations.
 
+V1.0.45
+1. Added code documentation using Gemini Code Assist AI.
+1. Optimized rapids in adaptive clearing, for best effect make sure that the Lead-In feedrate is slightly lower than the Cutting feedrate on the Linking tab.
+1. Code refactoring to make logic clearer and reduce redundancy.
+1. Improved laser and plasma ending moves.
+1. Add rapid approaches to cut when descending from RetractHeight, saves a lot of time.
+
 V1.0.44
 1. Fix movement ordering as suggested by zdima, Fusion360 has changed the order in which it outputs Z retracts causing some movements to
    be G1 when they should be G0.

@@ -56,14 +56,15 @@
    30 Mar 2024 - V1.0.42 : postprocessor.alert() method has disappeared - replaced with warning(msg) and writeComment(msg), moved more stuff into OB. and SPL.
    xx Oct 2024 - V1.0.43 : fix plasma pierce/cut height, pierceTime so it uses the tool settings if provided
    10 Aug 2025 - V1.0.44 : fix movement ordering and other tweaks, see readme.md
+   17 Aug 2025 - V1.0.45 : docs, refactored, new speed handling in adaptives, see README for details
 */
-obversion = 'V1.0.44';
+obversion = 'V1.0.45';
 description = "OpenBuilds CNC : GRBL/BlackBox";  // cannot have brackets in comments
 longDescription = description + " : Post " + obversion; // adds description to post library dialog box
 vendor = "OpenBuilds";
 vendorUrl = "https://openbuilds.com";
 model = "GRBL";
-legal = "Copyright Openbuilds 2025";
+legal = "Copyright Openbuilds and swarfer 2025";
 certificationLevel = 2;
 minimumRevision = 45892;
 
@@ -88,7 +89,20 @@ allowedCircularPlanes = (1 << PLANE_XY); // allow only XY plane
 //allowedCircularPlanes = (1 << PLANE_XY) | (1 << PLANE_ZX) | (1 << PLANE_YZ); // allow all planes, recentering arcs solves YZ/XZ arcs
 // if you allow vertical arcs then be aware that ObCONTROL will not display the gcode correctly, but it WILL cut correctly.
 
-// things for splitting on linecount, aka tapesplitting
+/**
+ * @typedef {object} SplittingState
+ * @property {number} tapelines - The maximum number of G-code lines allowed per file before a split is triggered. A value of 0 disables splitting by line count. This is set from the `splitLines` post-processor property.
+ * @property {number} linecnt - The current line counter for the active file. It is incremented with each call to `writeBlock`.
+ * @property {boolean} forceSplit - A flag that, when set to true, forces a file split at the beginning of the next section. This is used to signal that the line count has been exceeded.
+ */
+
+/**
+ * Manages the state for splitting G-code files based on line count ("tape splitting").
+ * This object holds the configuration and current status for the file splitting logic.
+ * Note that line counts will not be exact as we try to split at the next rapid movement 
+ * after linecount has been achieved.
+ * @type {SplittingState}
+ */
 var SPL = 
    {
    tapelines : 0,
@@ -330,24 +344,51 @@ var OB = {
    powerOn : false,     // is the laser power on? used for laser when haveRapid=false
    isLaser : false,     // set true for laser/water/
    isPlasma : false,    // set true for plasma
+   isMill : false,      // set true for mill and not laser and not plasma
    cutmode :  0,        // M3 or M4
    cuttingMode : 'none',  // set by onParameter for laser/plasma
    haveRapid : false,   // assume no rapid moves
-   movestr : 'unknown'  // movement type string for comments
+   movestr : 'unknown',  // movement type string for comments
+   movestrP : 'unknown'  // movement type string for comments
 }
+
+/**
+ * @typedef {object} HeightsState
+ * @property {number} retract - The Z-height to which the tool retracts during linking moves.
+ * @property {number} clearance - A safe Z-height used for initial positioning and tool checks.
+ * @property {number} top - The top height of the current operation, often used as a reference for plasma/laser cut heights.
+ */
+/**
+ * Manages the various height settings received from Fusion 360 operations.
+ * @type {HeightsState}
+ */
+var Heights = {
+   retract: 1,    // will be set by onParameter and used in onLinear to detect rapids
+   clearance: 10, // will be set by onParameter
+   top: 1         // set by onParameter
+   };
+
+/*
+   Keep track of feedrates, saved here by onParameter
+*/        
+var Feeds = {
+   cutting: 1,    // cutting feedrate
+   entry : 1,     // lead-in feedrate
+   exit : 1       // lead-out feedrate 
+   }
 
 var plasma = {
    pierceHeight : 3.14, // set by onParameter or tool.pierceHeight
    pierceTime : 3.14,   // plasma pierce delay set by tool if properties.spindleOnOffDelay = 0
    leadinRate : 314,    // set by onParameter: the lead-in feedrate,plasma : onparameter:movement:lead_in is always metric so convert when needed
    cutHeight : 3.14,    // tool cut height from onParameter
-   mode : 1             // mode 1 is the old mode using topheight as cutheight, mode 2 is new mode, using tool cutheight
-   }
+   mode : 1             // mode 1 is the old mode using topHeights as cutheight, mode 2 is new mode, using tool cutheight
+   };
 
 //var workOffset = 0;
-var retractHeight = 1;     // will be set by onParameter and used in onLinear to detect rapids
-var clearanceHeight = 10;  // will be set by onParameter
-var topHeight = 1;         // set by onParameter
+//var retractHeight = 1;     // will be set by onParameter and used in onLinear to detect rapids
+//var clearanceHeight = 10;  // will be set by onParameter
+//var topHeight = 1;         // set by onParameter
 var linmove = 1;           // linear move mode
 var toolRadius;            // for arc linearization
 var coolantIsOn = 0;       // set when coolant is used to we can do intelligent turn off
@@ -494,23 +535,45 @@ function defineMachine() {
 }
 // End of machine configuration logic ======================================================================
 
+/**
+ * function to reformat a string to 'title case'  
+ * @param str the string to casify
+ * @returns entitled string
+ */
 function toTitleCase(str)
    {
-   // function to reformat a string to 'title case'
    return str.replace( /\w\S*/g, function(txt)
       {
       // /\w\S*/g    keep that format, astyle will put spaces in it
       return txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase();
       });
    }
-
+// ------- use astyle below thisline -----------------
+/**
+ * Translates a spindle RPM into a manual dial setting for specific router models.
+ *
+ * This function takes a target RPM and calculates the corresponding dial setting
+ * (e.g., 1, 2.5, 6) for routers like Makita, Dewalt, and Router11. It uses linear
+ * interpolation for speeds that fall between the fixed dial settings.
+ *
+ * It also validates the requested RPM against the selected router's capabilities.
+ * If the RPM is out of range, it issues a warning to the user and clamps the
+ * dial setting to the nearest valid value (minimum or maximum).
+ *
+ * The supported router types and their speed mappings are:
+ * - **Dewalt 611**: [1: 16000, 2: 18200, 3: 20400, 4: 22600, 5: 24800, 6: 27000]
+ * - **Router11**: [1: 10000, 2: 14000, 3: 18000, 4: 23000, 5: 27000, 6: 32000]
+ * - **Makita RT0701 (Default)**: [1: 10000, 2: 12000, 3: 17000, 4: 22000, 5: 27000, 6: 30000]
+ *
+ * For probe operations, it returns a default dial setting of 1.
+ *
+ * @param {number} rpm The target spindle speed in revolutions per minute.
+ * @param {string} op The name of the current operation, used for logging warning messages.
+ * @returns {string|number} The calculated dial setting as a string with one decimal place (e.g., "2.5"),
+ * or an integer for the minimum/maximum settings.
+ */
 function rpm2dial(rpm, op)
    {
-   // translates an RPM for the spindle into a dial value, eg. for the Makita RT0700 and Dewalt 611 routers
-   // additionally, check that spindle rpm is between minimum and maximum of what our spindle can do
-   // array which maps spindle speeds to router dial settings,
-   // according to Makita RT0700 Manual : 1=10000, 2=12000, 3=17000, 4=22000, 5=27000, 6=30000
-   // according to Dewalt 611 Manual : 1=16000, 2=18200, 3=20400, 4=22600, 5=24800, 6=27000
    var wmsg = "";
 
    if (isProbeOperation())      
@@ -527,7 +590,7 @@ function rpm2dial(rpm, op)
          }
       else
          {
-         // this is Makita R0701
+         // this is Makita R0701 and default for 'other'
          var speeds = [0, 10000, 12000, 17000, 22000, 27000, 30000];
          }
 
@@ -560,38 +623,37 @@ function rpm2dial(rpm, op)
    return 0;
    }
 
+/**
+ * Checks various feed rates for a given operation against the GRBL minimum feed rate.
+ *
+ * This function retrieves the cutting, retract, entry, exit, ramp, and plunge feed rates
+ * from the provided section object. It compares each of these against the `minimumFeedRate`
+ * property (a GRBL controller limitation). If any feed rate is found to be below this
+ * minimum, it generates a detailed warning message. This message is both displayed to the
+ * user in the Fusion 360 post-process dialog and written as a comment in the output
+ * G-code file for on-machine reference.
+ *
+ * @param {object} section The Fusion 360 section object for the current operation,
+ *   which contains all toolpath parameters.
+ * @param {string} op A descriptive name or identifier for the current operation,
+ *   used within the warning message to help the user locate the issue.
+ * @returns {void} This function does not return a value.
+ */
 function checkMinFeedrate(section, op)
    {
    var alertMsg = "";
    if (section.getParameter("operation:tool_feedCutting") < minimumFeedRate)
-      {
       alertMsg = "Cutting\n";
-      }
-
    if (section.getParameter("operation:tool_feedRetract") < minimumFeedRate)
-      {
       alertMsg = alertMsg + "Retract\n";
-      }
-
    if (section.getParameter("operation:tool_feedEntry") < minimumFeedRate)
-      {
       alertMsg = alertMsg + "Entry\n";
-      }
-
    if (section.getParameter("operation:tool_feedExit") < minimumFeedRate)
-      {
       alertMsg = alertMsg + "Exit\n";
-      }
-
    if (section.getParameter("operation:tool_feedRamp") < minimumFeedRate)
-      {
       alertMsg = alertMsg + "Ramp\n";
-      }
-
    if (section.getParameter("operation:tool_feedPlunge") < minimumFeedRate)
-      {
       alertMsg = alertMsg + "Plunge\n";
-      }
 
    if (alertMsg != "")
       {
@@ -614,9 +676,9 @@ function writeBlock()
    }
 
 /**
-   Thanks to nyccnc.com
-   Thanks to the Autodesk Knowledge Network for help with this at
-   https://knowledge.autodesk.com/support/hsm/learn-explore/caas/sfdcarticles/sfdcarticles/How-to-use-Manual-NC-options-to-manually-add-code-with-Fusion-360-HSM-CAM.html!
+ * Thanks to nyccnc.com
+ * Thanks to the Autodesk Knowledge Network for help with this at
+ * https://knowledge.autodesk.com/support/hsm/learn-explore/caas/sfdcarticles/sfdcarticles/How-to-use-Manual-NC-options-to-manually-add-code-with-Fusion-360-HSM-CAM.html!
 */
 function onPassThrough(text)
    {
@@ -627,9 +689,12 @@ function onPassThrough(text)
       }
    }
 
+/**
+ * 3. here you can set all the properties of your machine if you havent set up a machine config in CAM.  These are optional and only used to print in the header.
+ * rather set up a real machine config
+ */
 function myMachineConfig()
    {
-   // 3. here you can set all the properties of your machine if you havent set up a machine config in CAM.  These are optional and only used to print in the header.
    myMachine = getMachineConfiguration();
    if (!myMachine.getVendor())
       {
@@ -650,9 +715,11 @@ function myMachineConfig()
       }
    }
 
-// Remove special characters which could confuse GRBL : $, !, ~, ?, (, )
-// In order to make it simple, I replace everything which is not A-Z, 0-9, space, : , .
-// Finally put everything between () as this is the way GRBL & UGCS expect comments
+/** 
+ * Remove special characters which could confuse GRBL : $, !, ~, ?, (, )
+ * In order to make it simple, I replace everything which is not A-Z, 0-9, space, : , .
+ * Finally put everything between () as this is the way GRBL & UGCS expect comments
+*/   
 function formatComment(text)
    {
    return ("(" + filterText(String(text), permittedCommentChars) + ")");
@@ -665,14 +732,25 @@ function getMachineTime(sec)
    {
    var machineTimeInSeconds = sec.getCycleTime();
    var machineTimeHours = Math.floor(machineTimeInSeconds / 3600);
-   machineTimeInSeconds = machineTimeInSeconds % 3600;
+   machineTimeInSeconds = machineTimeInSeconds % 3600;               // remove the hours
    var machineTimeMinutes = Math.floor(machineTimeInSeconds / 60);
-   var machineTimeSeconds = Math.floor(machineTimeInSeconds % 60);
+   var machineTimeSeconds = Math.floor(machineTimeInSeconds % 60);   // remove the minutes
    var machineTimeText = "  Machining time : ";
    machineTimeText += subst(localize("%1h:%2m:%3s"), machineTimeHours, machineTimeMinutes, machineTimeSeconds);
    return machineTimeText;
    }   
 
+/**
+ * Writes a formatted G-code comment to the output file, automatically handling line wrapping.
+ *
+ * This function takes a string and formats it as a valid GRBL comment (e.g., "(My Comment)").
+ * If the input text exceeds 70 characters, it intelligently splits the string at word
+ * boundaries to create multiple comment lines, each under the length limit. This prevents
+ * issues with G-code controllers that may not handle very long single-line comments.
+ *
+ * @param {string} text The comment string to write. Can be a single line or a long string that needs wrapping.
+ * @returns {void}
+ */
 function writeComment(text)
    {
    // v20 - split the line so no comment is longer than 70 chars
@@ -699,6 +777,24 @@ function writeComment(text)
       writeln(formatComment(text));
    }
 
+/**
+ * Writes the header information at the beginning of a G-code file.
+ *
+ * This function generates a comprehensive header containing metadata about the job,
+ * the post-processor, and the machine setup. It includes:
+ * - Product and post-processor version information.
+ * - Unit system (mm or inch).
+ * - Warnings for unsupported features (e.g., multiple tools in a single file).
+ * - A detailed list of all operations (or a subset for multi-file jobs),
+ *   including tool details, spindle speeds, work coordinates, and estimated machining time.
+ * - For multi-file jobs, it lists all generated filenames in the header of the first file.
+ * - It concludes by setting up the initial G-code modal states (G90, G94, G17, G21/G20).
+ *
+ * @param {number} secID The starting section (operation) ID. For the first file, this is 0.
+ *   For subsequent files in a multi-file job, this will be the ID of the first
+ *   operation in that new file.
+ * @returns {void}
+ */   
 function writeHeader(secID)
    {
    //writeComment("Header start " + secID);
@@ -788,25 +884,13 @@ function writeHeader(secID)
       var section = getSection(i);
       var tool = section.getTool();
       var rpm = section.getMaximumSpindleSpeed();
-      OB.isLaser = OB.isPlasma = false;
-      switch (tool.type)
-         {
-         case TOOL_LASER_CUTTER:
-            OB.isLaser = true;
-            break;
-         case TOOL_WATER_JET:
-         case TOOL_PLASMA_CUTTER:
-            OB.isPlasma = true;
-            break;
-         default:
-            OB.isLaser = false;
-            OB.isPlasma = false;
-         }
+
+      setOperationType(tool);
 
       if (section.hasParameter("operation-comment"))
          {
-         writeComment((i + 1) + " : " + section.getParameter("operation-comment"));
-         var op = section.getParameter("operation-comment")
+         var op = section.getParameter("operation-comment");
+         writeComment((i + 1) + " : " + op);
          }
       else
          {
@@ -820,7 +904,27 @@ function writeHeader(secID)
       if (OB.isLaser || OB.isPlasma)
          {
          writeComment("  Tool #" + tool.number + ": " + toTitleCase(getToolTypeName(tool.type)) + " Diam = " + xyzFormat.format(tool.jetDiameter) + unitstr);
-         writeComment("howto use this post for plasma https://github.com/OpenBuilds/OpenBuilds-Fusion360-Postprocessor/blob/master/README-plasma.md");
+         if (OB.isPlasma)
+            writeComment("How to use this post for plasma https://github.com/OpenBuilds/OpenBuilds-Fusion360-Postprocessor/blob/master/README-plasma.md");
+         if (OB.isLaser)   
+            switch (section.getJetMode() )
+               {
+               case JET_MODE_THROUGH:
+                  OB.power = calcPower(properties.PowerThrough);
+                  writeComment("  LASER THROUGH CUTTING " + properties.PowerThrough + "percent = S" + OB.power);
+                  break;
+               case JET_MODE_ETCHING:
+                  OB.power = calcPower(properties.PowerEtch);
+                  writeComment("  LASER ETCH CUTTING " + properties.PowerEtch + "percent = S" + OB.power);
+                  break;
+               case JET_MODE_VAPORIZE:
+                  OB.power = calcPower(properties.PowerVaporise);
+                  writeComment("  LASER VAPORIZE CUTTING " + properties.PowerVaporise + "percent = S" + OB.power);
+                  break;
+               default:
+                  error(localize("Unsupported cutting mode."));
+                  return;
+               }
          }
       else
          {
@@ -840,7 +944,7 @@ function writeHeader(secID)
                   }
                else
                   {
-                  writeComment("  Spindle : RPM = " + round(rpm, 0));
+                  writeComment("  Spindle : RPM = " + round(rpm, 0) + " " + properties.routerType);
                   }
             }      
          }
@@ -859,6 +963,11 @@ function writeHeader(secID)
             }
          }
       }
+
+   // Restore the OB state to be correct for the current tool. The loop above
+   // will have left the state set for the *last* tool in the entire job.
+   setOperationType(getSection(secID).getTool());
+
    if (OB.isLaser || OB.isPlasma)
       {
       allowHelicalMoves = false; // laser/plasma not doing this, ever
@@ -889,9 +998,25 @@ function writeHeader(secID)
       }
    }
 
+/**
+ * Initializes the post-processing job, performs critical validation, and writes the file header.
+ *
+ * This is the main entry point function called by the CAM system when the post-processor
+ * is executed. It orchestrates the initial setup by:
+ * 1.  Activating the machine configuration, either from the CAM setup or a hardcoded definition.
+ * 2.  Initializing state for features like splitting G-code files by line count.
+ * 3.  Performing several crucial validation checks:
+ *     -   Ensuring radius compensation is not used, as it's unsupported by GRBL (fatal error).
+ *     -   Detecting if the same tool number is assigned to tools with different geometries (fatal error).
+ *     -   Warning the user if multiple tools are present but the multi-file output option is disabled.
+ * 4.  Calculating the number of files to be generated based on tool changes.
+ * 5.  Calling `writeHeader()` to output the initial comments, settings, and operation list.
+ * 6.  Configuring initial states for Z-axis motion, especially for plasma and laser operations.
+ *
+ * @returns {void} This function does not return a value.
+ */
 function onOpen()
    {
-
    receivedMachineConfiguration = machineConfiguration.isReceived();
    if (typeof defineMachine == "function") 
       {
@@ -899,7 +1024,6 @@ function onOpen()
       }
    activateMachine(); // enable the machine optimizations and settings
     
-
    // 3. moved to top of file
    //myMachineConfig();
    numberOfSections = getNumberOfSections();
@@ -1004,16 +1128,47 @@ function forceAll()
    mOutput.reset();
    }
 
-// calculate the power setting for the laser
+/**
+ * Calculates the raw PWM value for a given power percentage for the laser.
+ *
+ * This function translates a power level, specified as a percentage (0-100),
+ * into a raw value suitable for the 'S' word in G-code, which controls
+ * spindle speed or laser/plasma power. It linearly maps the percentage to a
+ * configurable PWM range.
+ *
+ * The default range is [0, 1000], corresponding to GRBL's default spindle
+ * speed settings. These values (PWMMin, PWMMax) can be modified directly
+ * within the function if a different range is required.
+ *
+ * @param {number} perc The desired power level as a percentage (0-100).
+ * @returns {number} The calculated raw PWM value (e.g., 50% returns 500).
+ */
 function calcPower(perc)
    {
    var PWMMin = 0;  // make it easy for users to change this
    var PWMMax = 1000;
    var v = PWMMin + (PWMMax - PWMMin) * perc / 100.0;
-   return v;
+   return round(v,0);
    }
 
-// go to initial position and optionally output the height check code before spindle turns on
+/**
+ * Moves the tool to the initial XY position for the current operation.
+ *
+ * This function generates a rapid G0 move to the starting XY coordinates of the
+ * current section. It also includes an optional, user-configurable feature to
+ * perform a tool height check for milling operations.
+ *
+ * The tool height check, if enabled via post properties (`checkZ`), will:
+ * 1. Move the tool at a specified feed rate (`checkFeed`) to the `Heights.clearance`.
+ * 2. Issue a program pause (M0) to allow the operator to verify the tool length.
+ *
+ * This check is only performed for the first section of a new file and is
+ * automatically disabled for laser and plasma operations.
+ *
+ * @param {boolean} checkit If true, enables the tool height check routine,
+ *   provided the corresponding post properties are also enabled.
+ * @returns {void}
+ */
 function gotoInitial(checkit)
    {
    if (debugMode) writeComment("gotoInitial start");
@@ -1021,6 +1176,7 @@ function gotoInitial(checkit)
    var section = getSection(sectionId);         // what is the section-object for this operation
    var maxfeedrate = section.getMaximumFeedrate();
    var f = "";
+   var z;
    
    // Rapid move to initial position, first XY, then Z, and do tool height check if needed
    forceAny();
@@ -1036,8 +1192,8 @@ function gotoInitial(checkit)
    if (checkit)
       if ( (isNewfile || isFirstSection()) && properties.checkZ && (properties.checkFeed > 0) )
          {
-         // do a Peter Stanton style Z seek and stop for a height check
-         z = zOutput.format(clearanceHeight);
+         // do a Peter Stanton style Z seek and stop for a height check - https://youtu.be/WMsO24IqRKU?t=1059
+         z = zOutput.format(Heights.clearance);
          f = feedOutput.format(toPreciseUnit(properties.checkFeed, MM));
          writeln("(Tool Height check https://youtu.be/WMsO24IqRKU?t=1059)");
          writeBlock(gMotionModal.format(1), z, f );
@@ -1046,20 +1202,67 @@ function gotoInitial(checkit)
    if (debugMode) writeComment("gotoInitial end");
    }
 
-/*
- * write a G53 Z retract
- * might need to gMotionModal.reset() before this to force output
+/**
+ * Generates a G53 G0 command to retract the Z-axis to a safe, absolute machine coordinate.
+ *
+ * This function creates a critical safety move. It uses a non-modal `G53` command,
+ * which temporarily overrides the current work coordinate system (like G54) and
+ * moves the Z-axis relative to the machine's home position. This ensures a
+ * predictable and safe retract height, regardless of the active work offset.
+ *
+ * The target Z position is read from the `properties.machineHomeZ` post-processor
+ * property, which is always interpreted in millimeters.
+ *
+ * A comment is also written to the G-code file, warning the operator that this
+ * move relies on the machine having been properly homed.
+ *
+ * The function also manages modal states by resetting the Z-axis output and the
+ * motion modal group to ensure the next move command is explicitly written.
+ *
+ * @returns {void} This function does not return a value.
  */
 function writeZretract()
    {
    zOutput.reset();
+   gMotionModal.reset();
+   //gFormat.reset();
    writeln("(This relies on homing, see https://openbuilds.com/search/127200199/?q=G53+fusion )");
    writeBlock(gFormat.format(53), gMotionModal.format(0), zOutput.format(toPreciseUnit( properties.machineHomeZ, MM)));  // Retract spindle to Machine Z Home
    gMotionModal.reset();
    zOutput.reset();
    }
 
-
+/**
+ * Main event handler called at the beginning of each CAM operation (section).
+ *
+ * This function orchestrates the setup for each distinct operation in the CAM file.
+ * It is responsible for a wide range of tasks, including:
+ *
+ * - **File Management**: Detects if a new file needs to be created due to a tool
+ *   change or if the line count limit has been exceeded. It manages the process
+ *   of closing the previous file and opening a new one with a proper header and
+ *   resume sequence.
+ * - **Operation Setup**: Determines the type of operation (milling, laser, plasma)
+ *   and configures the post-processor's internal state accordingly.
+ * - **Validation**: Performs critical checks, such as ensuring unsupported radius
+ *   compensation is not used and validating pierce/cut heights for plasma/laser tools.
+ * - **WCS Handling**: Manages the Work Coordinate System (e.g., G54, G55), issuing
+ *   the correct command and performing safety retracts if the WCS changes between
+ *   sections.
+ * - **Tool Initialization**:
+ *   - For milling, it handles the initial Z-retract, moves to the start position,
+ *     and starts the spindle with the correct speed and delay.
+ *   - For laser/plasma, it sets power levels and cutting modes and handles initial
+ *     Z moves if enabled.
+ * - **State Reset**: Resets modal G-code states to ensure the new section starts
+ *   cleanly without unexpected behavior from the previous section.
+ *
+ * This function contains several local helper functions (prefixed with `L_`) to
+ * manage its complexity.
+ *
+ * @returns {void} This function does not return a value. It modifies the G-code
+ *   output and internal state directly.
+ */
 function onSection()
    {
    var nmbrOfSections = getNumberOfSections();  // how many operations are there in total
@@ -1070,6 +1273,7 @@ function onSection()
    var amProbing = false;
    OB.haveRapid = false; // drilling sections will have rapids even when other ops do not, and so do probe routines
 
+   setOperationType(tool); // sets isLaser etc
    onRadiusCompensation(); // must check every section
 
    if (OB.isPlasma || OB.isLaser)
@@ -1088,10 +1292,10 @@ function onSection()
          error("CUT HEIGHT MUST BE BELOW PLASMA TOOL PIERCE HEIGHT (tool setting)");
          }
       if ( (plasma.cutHeight == 0) || (tool.cutHeight == 0) )
-         if ((topHeight <= 0) && properties.plasma_usetouchoff)
+         if ((Heights.top <= 0) && properties.plasma_usetouchoff)
             error("TOPHEIGHT MUST BE GREATER THAN 0 (heights tab) when tool has no cutHeight");
       writeComment(whoami + " pierce height " + round(plasma.pierceHeight,3));
-      writeComment(whoami + " topHeight " + round(topHeight,3));
+      writeComment(whoami + " topHeight " + round(Heights.top,3));
       writeComment(whoami + " cutHeight " + round(plasma.cutHeight,3));
       writeComment(whoami + " pierceTime " + round(plasma.pierceTime,3));
       }
@@ -1099,6 +1303,7 @@ function onSection()
       {
       // fake the radius larger else the arcs are too small before being linearized since kerfwidth is very small compared to normal tools
       toolRadius = tool.kerfWidth * 3;
+      allowHelicalMoves = false; // laser/plasma not doing this, ever
       }
    else
       {
@@ -1157,9 +1362,9 @@ function onSection()
       }
    writeComment(comment);
    if (debugMode)
-      writeComment("retractHeight = " + round(retractHeight,3));
+      writeComment("Heights.retract = " + round(Heights.retract, 3));
 
-   // Write the WCS, ie. G54 or higher.. default to WCS1 / G54 if no or invalid WCS
+   // retract again if no first section and WCS changed
    if (!isFirstSection() && (currentworkOffset !=  (53 + section.workOffset)) )
       {
       writeZretract();
@@ -1176,8 +1381,9 @@ function onSection()
       }
    else
       {
-      writeBlock(gWCSOutput.format(53 + section.workOffset));  // use the selected WCS
+      // Write the WCS, ie. G54 or higher.. default to WCS1 / G54 if no or invalid WCS
       currentworkOffset = 53 + section.workOffset;
+      writeBlock(gWCSOutput.format(currentworkOffset));  // use the selected WCS
       }
    writeBlock(gAbsIncModal.format(90));  // Set to absolute coordinates
 
@@ -1193,7 +1399,6 @@ function onSection()
       else
          clnt = setCoolant(tool.coolant); // use tool setting
       }
-
 
    OB.cutmode = -1;
    //writeComment("isMilling=" + isMilling() + "  isjet=" +isJet() + "  islaser=" + isLaser);
@@ -1212,7 +1417,7 @@ function onSection()
          OB.isLaser = true;
          OB.isPlasma = false;
          var pwas = OB.power;
-         switch (currentSection.jetMode)
+         switch (currentSection.getJetMode() )
             {
             case JET_MODE_THROUGH:
                OB.power = calcPower(properties.PowerThrough);
@@ -1369,6 +1574,20 @@ function onSection()
    //writeComment("onSection end");
    }
 
+/**
+ * Generates a G-code dwell command (G4).
+ *
+ * This function creates a program pause for a specified duration. It validates
+ * the input duration to be within a reasonable range (0.0 to 999 seconds).
+ *
+ * If the requested duration is outside this range, it defaults to a special
+ * value of 3.14 seconds. This prevents errors from invalid G-code while
+ * allowing the post-processing to complete, signaling a minor oversight
+ * in the input parameters without halting the job.
+ *
+ * @param {number} seconds The duration of the dwell in seconds.
+ * @returns {void}
+ */
 function onDwell(seconds)
    {
    if ((seconds < 0.0) || (seconds > 999))
@@ -1391,27 +1610,44 @@ function onSpindleSpeed(spindleSpeed)
 function onMovement(movement) 
    {
    var jet = tool.isJetTool && tool.isJetTool();
-   OB.movestr = getMovementStringId(movement, jet);
+   var movestr = getMovementStringId(movement, jet);
+   if (movestr != OB.movestr)
+      {
+      OB.movestrP = OB.movestr;   // save old movestr
+      OB.movestr = movestr;   // save new movestr
+      }   
    }
 
 function onRadiusCompensation()
    {
    var radComp = getRadiusCompensation();
-   var sectionId = getCurrentSectionId();
    if (radComp != RADIUS_COMPENSATION_OFF)
       {
+      var sectionId = getCurrentSectionId();
       warning("ERROR : RadiusCompensation is not supported in GRBL - Change RadiusCompensation in CAD/CAM software to Off/Center/Computer");
       error("Fatal Error in Operation " + (sectionId + 1) + ": RadiusCompensation is found in CAD file but is not supported in GRBL");
       return;
       }
    }
 
+/**
+   Handles rapid moves (G0).
+   This function is called for every rapid traversal move in the toolpath. It generates
+   the appropriate G0 command and handles specific logic for different operation types.
+   For milling, it's a standard G0 XYZ move. For plasma, it manages the Z height
+   to avoid crashing into the material before a pierce cycle. It also checks if the
+   g-code file needs to be split due to line count limits.
+
+   @param {number} _x The target X-coordinate for the rapid move.
+   @param {number} _y The target Y-coordinate for the rapid move.
+   @param {number} _z The target Z-coordinate for the rapid move.
+*/
 function onRapid(_x, _y, _z)
    {
    if (debugMode) writeComment("onRapid " + OB.haveRapid);      
    OB.haveRapid = true;
    //if (debugMode) writeComment("onRapid");
-   if (!OB.isLaser && !OB.isPlasma)
+   if (OB.isMill)
       {
       var x = xOutput.format(_x);
       var y = yOutput.format(_y);
@@ -1419,7 +1655,8 @@ function onRapid(_x, _y, _z)
 
       if (x || y || z)
          {
-         writeBlock(gMotionModal.format(0), x, y, z, " ; real rapid");
+         linmode = 0;
+         writeBlock(gMotionModal.format(0), x, y, z);
          feedOutput.reset();
          }
       }
@@ -1443,21 +1680,31 @@ function onRapid(_x, _y, _z)
       //    }
       // else
       if (x || y || z)
+         {
+         linmode = 0;
          writeBlock(gMotionModal.format(0), x, y, z);
+         }
       }
-   // split file here   
-   if (SPL.linecnt > SPL.tapelines)   
-      {
-      if (debugMode) writeComment('Rapid Tapelines ' + SPL.tapelines);
-      SPL.linecnt = 0;
-      var maxfeedrate = getSection( getCurrentSectionId() ).getMaximumFeedrate();      
-      splitHere(_x,_y,_z,maxfeedrate);
-      }
+   // split AFTER rapid move since it is most likely to be a safe spot to resume from      
+   if (handleFileSplitting(_x, _y, _z, 0, true)) 
+      return;
    }
 
+/**
+   Handles linear moves (G1).
+   This function is called for every linear move in the toolpath. It determines whether
+   the move should be a rapid (G0) or a feed move (G1) based on the operation type
+   (milling vs. laser/plasma) and the current state (e.g., power on/off, Z height).
+   It also handles splitting the G-code into multiple files if the line count limit is reached.
+
+   @param {number} _x The target X-coordinate for the linear move.
+   @param {number} _y The target Y-coordinate for the linear move.
+   @param {number} _z The target Z-coordinate for the linear move.
+   @param {number} feed The feed rate for the move.
+*/
 function onLinear(_x, _y, _z, feed)
    {
-   //if (debugMode) writeComment("onLinear " + OB.haveRapid);
+   if (debugMode) writeComment("onLinear " + OB.haveRapid + " ismill " + OB.isMill);
    if (OB.powerOn || OB.haveRapid)   // do not reset if power is off - for laser G0 moves
       {
       xOutput.reset();
@@ -1466,41 +1713,65 @@ function onLinear(_x, _y, _z, feed)
    var x = xOutput.format(_x);
    var y = yOutput.format(_y);
    var f = feedOutput.format(feed);
-   if (!OB.isLaser && !OB.isPlasma)
-      {
-      var z = zOutput.format(_z);
+   linmove = 1;          // have to have a default!
 
+   // Determine if the upcoming move is a rapid move (G0)
+   var isRapidMove = false;
+   if (OB.isMill)
+      {
+      // For milling, a move to or above Heights.retract is a rapid move (if not in a rapid cycle)
+      //if (debugMode) 
+      if (!OB.haveRapid && nearGE(_z , Heights.retract) )
+         isRapidMove = true;
+      // a direct move is rapid, used in adaptive clearing   
+      if (OB.movestr == 'direct')  
+         {
+         //writeComment('direct to rapid');
+         var start = getCurrentPosition();
+         var end = new Vector(_x, _y, _z);
+         // only if a longer move than toolRadius
+         if (Vector.diff(start, end).length > toolRadius)
+            isRapidMove = true; 
+         }
+      if (Feeds.cutting != Feeds.entry) // forces presense of leadin moves which we need
+         if ((OB.movestrP == 'lead out') && (OB.movestr == 'cutting'))
+            isRapidMove = true;
+      }
+   else
+      {
+      // For laser/plasma, any move with the power off is a rapid move
+      isRapidMove = !OB.powerOn;
+      }
+   linmove  = isRapidMove ? 0 : 1;
+   if (isRapidMove)
+      gMotionModal.reset(); // want G word for rapids
+
+   if (OB.isMill)
+      {
+      var currentZ = zOutput.getCurrent();
+      var z = zOutput.format(_z);
       if (x || y || z)
          {
-         linmove = 1;          // have to have a default!
-         if (!OB.haveRapid) 
-            {
-            // always check height, not only when Z changes as it was previously, Fusion changed the order of movements for personal use   
-            // pointed out by zdima on github, thanks
-            if (_z < retractHeight)    // compare it to retractHeight, below that is G1, >= is G0
-               linmove = 1;
-            else
-               {
-               linmove = 0;
-               gMotionModal.reset();   // force, always have G0 on every G0 line
-               feedOutput.reset();     // force feed on next G1 line
-               f = '';                 // no feed on rapid  moves
-               if (debugMode) writeComment("NOrapid");
-               }
-            }
+         // if at retract and going below top then rapid to top+0.25mm to save time   
+         if (nearGE(currentZ, Heights.retract))
+             if (_z < Heights.top)
+                {
+                // approach surface rapidly to just above top height  
+                //writeBlock(gMotionModal.format(0), zOutput.format(Heights.top + toPreciseUnit(0.25,MM)), " ; approach");
+                writeBlock(gMotionModal.format(0), zOutput.format(Heights.top + toPreciseUnit(0.25,MM)) );
+                feedOutput.reset();
+                f = feedOutput.format(feed); // force feed output after approach move
+                }
+         //writeBlock(gMotionModal.format(linmove), x, y, z, f, " ; ", OB.movestr);
          writeBlock(gMotionModal.format(linmove), x, y, z, f);
          }
       else
          if (f)
             {
             if (getNextRecord().isMotion())
-               {
                feedOutput.reset(); // force feed on next line
-               }
             else
-               {
                writeBlock(gMotionModal.format(1), f);
-               }
             }
       }
    else
@@ -1514,49 +1785,76 @@ function onLinear(_x, _y, _z, feed)
           //  z = 'z0';
          if (debugMode && z != "")            writeComment("onlinear z = " + z);
          var s = sOutput.format(OB.power);
-            // laser/plasma does some odd routing that should be rapid if power is off
-            // this is the new process when we dont have onRapid but GRBL requires G0 moves for noncutting laser moves
-         if (OB.powerOn)
+         // For laser/plasma, G0 is used for non-cutting moves (power off)
+         // and G1 is used for cutting moves (power on). The OB.haveRapid
+         // flag is not needed here as the logic is the same regardless.
+         if (isRapidMove)
             {
-            linmove = 1;
-            writeBlock(gMotionModal.format(1), x, y, z, f, s);
+            f = '';  // do not output feed for rapid moves
+            feedOutput.reset();  // force it on next G1 move
             }
-         else
-            {
-            linmove = 0;
-            writeBlock(gMotionModal.format(0), x, y, z,  s);
-            feedOutput.reset();
+         writeBlock(gMotionModal.format(linmove), x, y, z, f, s);
             }
          }
+   if (handleFileSplitting(_x, _y, _z, feed, isRapidMove)) 
+      return;
       }
-   // TODO move this to onRapid?   somehow we want to split on rapid moves not the middle of a cut, but there may be no rapids....
-   if (!OB.haveRapid && (linmove == 0) )
-      if (SPL.linecnt > SPL.tapelines)   
-         {
-         if (debugMode) writeComment('Tapelines ' + SPL.tapelines);
-         SPL.linecnt = 0;
-         splitHere(_x,_y,_z,feed);
-         }
-   }
 
+/**
+ * GRBL cannot do 5D and nor can this post
+ */
 function onRapid5D(_x, _y, _z, _a, _b, _c)
    {
    warning("ERROR : Tool-Rotation detected - this GRBL post only supports 3 Axis");
    error("Tool-Rotation detected but this GRBL post only supports 3 Axis");
    }
 
+/**
+ * GRBL cannot do 5D and nor can this post
+ */
 function onLinear5D(_x, _y, _z, _a, _b, _c, feed)
    {
    warning("ERROR : Tool-Rotation detected - this GRBL post only supports 3 Axis");
    error("Tool-Rotation detected but this GRBL post only supports 3 Axis");
    }
 
-// this code was generated with the help of ChatGPT AI
-// calculate the centers for the 2 circles passing through both points at the given radius
-// if you ask chatgpt that ^^^ you will get incorrect code!
-// if error then returns -9.9375 for all coordinates
-// define points as var point1 = { x: 0, y: 0 };
-// returns an array of 2 of those things comprising the 2 centers
+/**
+   Calculates the two possible centers for a circle of a given radius that passes
+   through two given points in a 2D plane.
+
+   Original doc
+   this code was generated with the help of ChatGPT AI
+   calculate the centers for the 2 circles passing through both points at the given radius
+   if you ask chatgpt that ^^^ you will get incorrect code!
+   if error then returns -9.9375 for all coordinates
+   define points as var point1 = { x: 0, y: 0 };
+   returns an array of 2 of those things comprising the 2 centers
+
+   Gemini AI generated doc
+   This is a geometric calculation. For any two distinct points on a circle and a given
+   radius, there are generally two possible circles that satisfy these conditions. This
+   function finds the centers of both.
+
+   If the distance between `point1` and `point2` is greater than twice the radius
+   (the diameter), no such circle can exist. In this case, the function returns
+   two center points with coordinates set to a specific magic number (-9.9375)
+   to indicate an error.
+
+   The value -9.9375 is chosen specifically because it has an exact finite
+   representation in binary floating-point numbers (unlike a number like 0.1).
+   This allows the calling code to perform a direct and reliable equality check
+   (e.g., `result == -9.9375`) to detect the error condition without worrying
+   about floating-point inaccuracies.
+
+   Note: The original author notes this code was generated with the help of AI.
+
+   @param {{x: number, y: number}} point1 The first point on the circle's circumference.
+   @param {{x: number, y: number}} point2 The second point on the circle's circumference.
+   @param {number} radius The radius of the circle.
+   @returns {Array<{x: number, y: number}>} An array containing two objects,
+     each representing a possible center point with `x` and `y` coordinates.
+     In case of an error, both points will have coordinates of -9.9375.
+*/
 function calculateCircleCenters(point1, point2, radius)
    {
    // Calculate the distance between the points
@@ -1624,10 +1922,29 @@ function newCenter(p1, p2, oldcenter, radius)
       return nc2;
    }
 
-/*
-   helper for on Circular - calculates a new center for arcs with differing radii
-   returns the revised center vector
-   maps arcs to XY plane, recenters, and reversemaps to return the new center in the correct plane
+/**
+ * Recalculates the center point of an arc to correct for radius discrepancies.
+ *
+ * G-code controllers like GRBL are strict and require the distance (radius) from the
+ * arc's center to its start point to be almost exactly equal to the distance from
+ * the center to its end point. Due to floating-point inaccuracies or issues in the
+ * source CAM data, these radii can sometimes differ, causing a "G2/G3 Radius to end
+ * point mismatch" error on the machine.
+ *
+ * This function provides a geometric solution. It calculates a new center point that is
+ * guaranteed to be equidistant from the provided start and end points.
+ *
+ * For arcs in vertical planes (ZX and YZ), it cleverly projects the 3D coordinates
+ * onto a temporary 2D XY plane, performs the standard 2D circle center calculation
+ * via the `newCenter` helper, and then maps the corrected 2D center back to the
+ * original 3D plane.
+ *
+ * @param {Vector} start The Vector representing the arc's start point.
+ * @param {Vector} end The Vector representing the arc's end point.
+ * @param {Vector} center The original, potentially inaccurate, center point Vector.
+ * @param {number} radius The nominal radius of the arc.
+ * @param {number} cp The constant representing the circular plane (e.g., PLANE_XY, PLANE_ZX).
+ * @returns {Vector} The recalculated, more accurate center point Vector.
 */   
 function ReCenter(start, end, center, radius, cp)
    {
@@ -1702,6 +2019,76 @@ function ReCenter(start, end, center, radius, cp)
    return center;
    }
 
+/**
+ * Checks if a file split is required based on the line count and triggers it if necessary.
+ * This is intended to be called after a motion command, preferably a rapid move,
+ * to ensure a safe resume point.
+ *
+ * @param {number} x The current X-coordinate, used to resume motion after the split.
+ * @param {number} y The current Y-coordinate, used to resume motion after the split.
+ * @param {number} z The current Z-coordinate, used to resume motion after the split.
+ * @param {number} feed The current feed rate, used to resume motion after the split.
+ * @param {boolean} isRapid A flag indicating if the last move was a rapid move.
+ *   Splitting is only performed after a rapid move unless the line count exceeds the
+ *   limit by more than 10%, in which case a split is forced.
+ * @returns {boolean} Returns true if a file split was performed, otherwise false.
+ */
+function handleFileSplitting(x, y, z, feed, isRapid)
+   {
+   if (SPL.tapelines > 0 && SPL.linecnt > SPL.tapelines)
+      {
+      // Force a split if the line count exceeds the limit by 10% to prevent huge files, else wait for a safe rapid move.
+      var forceSplit = SPL.linecnt > (SPL.tapelines * 1.1);
+      if (isRapid || forceSplit)
+         {
+         if (debugMode)
+            {
+            if (forceSplit)
+               writeComment('Forcing split: line count (' + SPL.linecnt + ') > 110% of limit (' + Math.round(SPL.tapelines * 1.1) + ').');
+            else
+               writeComment('Tapelines ' + SPL.tapelines + ' exceeded. Splitting file at rapid move.');
+            }
+         SPL.linecnt = 0;
+         splitHere(x, y, z, feed);
+         return true; // A split occurred
+         }
+      }
+   return false; // No split occurred
+   }
+
+/**
+ * Handles the generation of circular (G2/G3) and helical arc moves.
+ *
+ * This function is a critical part of the post-processor, containing extensive logic
+ * to prevent common "Arc Radius to End Point Mismatch" errors on GRBL controllers.
+ * It employs a multi-step strategy to ensure valid G-code output:
+ *
+ * 1.  **Full Circle Check**: Immediately linearizes full 360-degree circles, which are
+ *     not supported by IJK-center format G-code.
+ * 2.  **Center Point Correction**: Adjusts the off-plane coordinate of the arc's center
+ *     to be the average of the start and end points, which pre-emptively fixes many
+ *     radius errors in helical moves.
+ * 3.  **Radius Recalculation**: If a radius mismatch is detected between the start->center
+ *     and end->center distances, it calls the `ReCenter` helper function to calculate a
+ *     new, geometrically perfect center point.
+ * 4.  **Strategic Linearization**: It will intentionally convert the arc to a series of
+ *     small straight lines (`linearize()`) under specific conditions:
+ *     - If the arc's radius is smaller than the tool's radius (and the property is enabled).
+ *     - If it's a non-cutting (rapid) move during a laser or plasma operation.
+ *     - If the arc is on a vertical plane (ZX/YZ) during a laser or plasma operation.
+ * 5.  **G-Code Output**: If the arc is deemed safe, it generates the final G2/G3 command
+ *     with the appropriate plane (G17/G18/G19) and IJK values.
+ *
+ * @param {boolean} clockwise True for a G2 (clockwise) arc, false for a G3 (counter-clockwise) arc.
+ * @param {number} cx The X-coordinate of the arc's center point.
+ * @param {number} cy The Y-coordinate of the arc's center point.
+ * @param {number} cz The Z-coordinate of the arc's center point.
+ * @param {number} x The X-coordinate of the arc's end point.
+ * @param {number} y The Y-coordinate of the arc's end point.
+ * @param {number} z The Z-coordinate of the arc's end point.
+ * @param {number} feed The feed rate for the arc move.
+ * @returns {void} This function does not return a value.
+ */
 function onCircular(clockwise, cx, cy, cz, x, y, z, feed)
    {
    var start = getCurrentPosition();
@@ -1716,7 +2103,20 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed)
       linearize(tolerance);
       return;
       }
-
+   if (!OB.haveRapid && (OB.movestr == 'direct') )
+      {
+      // direct arc moves might as well be rapid since they are bracketed by rapids
+      //writeComment("linearize direct move");
+      gMotionModal.format(0);
+      var chord =  Vector.diff(start,end).length;
+      if (chord > toolRadius)
+         var tol = toPreciseUnit(0.1,MM);
+      else
+         var tol = tolerance * 10;
+      //writeComment("chord " + round(chord,3) + " " + round(tol,3) + " " + round(start.x,3) +":"+  round(start.y,3) + " : " + round(end.x,3) + " " + round(end.y,3) );
+      linearize(tol);         // dont need high resolution arcs
+      return;
+      }
    // first fix the center 'height'
    // for an XY plane, fix Z to be between start.z and end.z
    switch (cp)
@@ -1744,15 +2144,10 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed)
          {
          var diff = r1 - r2;
          var pdiff = Math.abs(diff / r1 * 100);
+         writeComment("recenter");
+         writeComment("r1 " + r1 + " r2 " + r2 + " d " + (r1 - r2) + " pdiff " + pdiff );
          }
-      // if percentage difference too great
-      //if (pdiff > 0.01)   1% is too much, arc with diff of 0.68% fails GRBL test
-      //   {
-         if (debugMode)  writeComment("recenter");
-         // adjust center to make radii equal
-         if (debugMode) writeComment("r1 " + r1 + " r2 " + r2 + " d " + (r1 - r2) + " pdiff " + pdiff );
-         center = ReCenter(start, end, center, (r1 + r2) /2, cp);
-      //   }
+      center = ReCenter(start, end, center, (r1 + r2) /2, cp);
       }
 
    // arcs smaller than bitradius always have significant radius errors, 
@@ -1760,7 +2155,7 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed)
    // note that larger arcs still have radius errors, but they are a much smaller percentage of the radius
    // and GRBL won't care
    var rad = Vector.diff(start,center).length;  // radius to NEW Center if it has been calculated
-   //TODO change this to always recenter for rad < toolRadius and toolDiam < 3/8", seems these conditions are too lax
+   //DONE change this to always recenter for rad < toolRadius and toolDiam < 3/8", seems these conditions are too lax
    if ( (rad < toPreciseUnit(6, MM)) || OB.isPlasma)  // only for small arcs, dont need to linearize a 24mm arc on a 50mm tool
       if (properties.linearizeSmallArcs && (rad < toolRadius))
          {
@@ -1784,7 +2179,7 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed)
             xOutput.reset();  // must always have X and Y
             yOutput.reset();
             // dont need to do ioutput and joutput because they are reference variables
-            if (!OB.isLaser && !OB.isPlasma)
+            if (OB.isMill)
                writeBlock(gPlaneModal.format(17), gMotionModal.format(clockwise ? 2 : 3), xOutput.format(x), yOutput.format(y), zOutput.format(z), iOutput.format(center.x - start.x, 0), jOutput.format(center.y - start.y, 0), feedOutput.format(feed));
             else
                {
@@ -1794,7 +2189,7 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed)
                }
             break;
          case PLANE_ZX:
-            if (!OB.isLaser && !OB.isPlasma)
+            if (OB.isMill)
                {
                xOutput.reset(); // always have X and Z
                zOutput.reset();
@@ -1804,7 +2199,7 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed)
                linearize(tolerance);
             break;
          case PLANE_YZ:
-            if (!OB.isLaser && !OB.isPlasma)
+            if (OB.isMill)
                {
                yOutput.reset(); // always have Y and Z
                zOutput.reset();
@@ -1819,9 +2214,25 @@ function onCircular(clockwise, cx, cy, cz, x, y, z, feed)
    }
 
 /**
- * force a file split here   
- * params are the current cut position and feedrate
- * TODO - set a flag and split at the next rapid move instead of instant split
+ * Orchestrates the splitting of a G-code file when the line count limit is exceeded.
+ *
+ * This function manages the safe transition from one file to the next by generating
+ * G-code to resume the toolpath at the exact point where the split occurred.
+ *
+ * The process involves setting a global flag (`SPL.forceSplit`) which is then
+ * detected by the `onSection` handler to trigger the creation of a new file and
+ * its header. After the new file is initiated, this function generates the
+ * necessary G-code to safely resume the operation:
+ * 1. A rapid move (G0) to the last known XY position at the operation's retract height.
+ * 2. A feed move (G1) to plunge the tool back down to the last known Z-depth
+ *    using the operation's plunge feed rate.
+ *
+ * @param {number} _x The X-coordinate where the split was triggered, used for the resume motion.
+ * @param {number} _y The Y-coordinate where the split was triggered, used for the resume motion.
+ * @param {number} _z The Z-coordinate where the split was triggered, used for the resume motion.
+ * @param {number} _f The feed rate at the time of the split. Note: This parameter is currently
+ *   unused; the plunge feed rate from the operation is used for the Z-resume move.
+ * @returns {void} This function does not return a value.
  */
 function splitHere(_x,_y,_z,_f)
    {
@@ -1834,8 +2245,8 @@ function splitHere(_x,_y,_z,_f)
    onSection();
    // goto x,y
    writeComment("Resume previous position");
-   invokeOnRapid(_x,_y,retractHeight);
-   haveRapid = false; // since we have faked a rapid move do not assume we have rapids for all other moves
+   invokeOnRapid(_x, _y, Heights.retract);
+   haveRapid = false;
    // goto z
    var sectionId = getCurrentSectionId();       // what is the number of this operation (starts from 0)
    var section = getSection(sectionId);         // what is the section-object for this operation
@@ -1844,15 +2255,35 @@ function splitHere(_x,_y,_z,_f)
    onLinear(_x,_y,_z,feed);  // feed back to previous cut level at plunge rate
    }   
 
+/**
+ * Handles cleanup and file closing at the end of a CAM operation (section).
+ *
+ * This function is called after all toolpath G-code for a section has been generated.
+ * Its primary responsibility is to determine if the current output file should be
+ * closed. This is crucial for multi-file generation (e.g., for tool changes).
+ *
+ * A file is closed under two conditions:
+ * 1. It is the last section of the entire job.
+ * 2. The `generateMultiple` property is enabled, and the next section uses a different tool.
+ *
+ * When a file is closed, this function calls `onClose()` to write the program footer
+ * (e.g., M5, M30, return to home) and then closes the file stream. It also resets
+ * motion and feed rate modals to ensure the next section starts with a clean state.
+ *
+ * @returns {void} This function does not return a value.
+ */
 function onSectionEnd()
    {
    writeln("");
    // writeBlock(gPlaneModal.format(17));
    if (isRedirecting())
       {
-      if ( (isLastSection() && isFirstSection() )   ||
-         (!isLastSection() && properties.generateMultiple && (tool.number != getNextSection().getTool().number) || (isLastSection() && !isFirstSection()))
-         )
+      // The file should be closed if this is the last section of the entire job,
+      // OR if a tool change is about to happen (making it the last section for this file).
+      var isLastSectionOfFile = isLastSection() ||
+        (!isLastSection() && properties.generateMultiple && (tool.number != getNextSection().getTool().number));
+
+      if (isLastSectionOfFile)
          {
          writeln("");
          onClose();
@@ -1864,10 +2295,34 @@ function onSectionEnd()
    forceAny();
    }
 
+/**
+ * Generates the final G-code sequence (footer) to safely end a program or file.
+ *
+ * This function is called to write the concluding commands for a G-code file.
+ * It ensures the machine is left in a safe state by performing the following actions:
+ *
+ * For Milling Operations:
+ * 1. Retracts the Z-axis to a safe machine coordinate using `writeZretract()` (G53 G0 Z...).
+ * 2. Stops the spindle (M5) and coolant (M9).
+ * 3. Moves the X and Y axes to a user-defined home position. This move can be in
+ *    machine coordinates (G53) or work coordinates depending on the `gotoMCSatend` property.
+ *
+ * For Laser/Plasma Operations:
+ * 1. Stops the power (M5) and coolant (M9).
+ * 2. If `UseZ` is enabled, it retracts the Z-axis to a safe machine coordinate.
+ * 3. For plasma, it also moves X and Y to the home position.
+ *
+ * The function concludes by writing the program end command (M30).
+ *
+ * @returns {void} This function does not return a value.
+ */
 function onClose()
    {
+   xOutput.reset();
+   yOutput.reset();
+   gMotionModal.reset();
    writeBlock(gAbsIncModal.format(90));   // Set to absolute coordinates for the following moves
-   if (!OB.isLaser && !OB.isPlasma)
+   if (OB.isMill)
       {
       gMotionModal.reset();  // for ease of reading the code always output the G0 words
       writeZretract();
@@ -1880,51 +2335,58 @@ function onClose()
       }
    //onDwell(properties.spindleOnOffDelay);                    // Wait for spindle to stop
    gMotionModal.reset();
-   if (!OB.isLaser && !OB.isPlasma)
+   if (OB.isMill)
       {
+      var g53 = '';
       if (properties.gotoMCSatend)    // go to MCS home
-         {
-         writeBlock(gAbsIncModal.format(90), gFormat.format(53), gMotionModal.format(0),
-                    "X" + xyzFormat.format(toPreciseUnit(properties.machineHomeX, MM)),
-                    "Y" + xyzFormat.format(toPreciseUnit(properties.machineHomeY, MM)));
-         }
-      else      // go to WCS home
-         {
-         writeBlock(gAbsIncModal.format(90), gMotionModal.format(0),
-                    "X" + xyzFormat.format(toPreciseUnit(properties.machineHomeX, MM)),
-                    "Y" + xyzFormat.format(toPreciseUnit(properties.machineHomeY, MM)));
-         }
+         g53 = gFormat.format(53);
+      writeBlock(g53, gFormat.format(0),
+                 "X" + xyzFormat.format(toPreciseUnit(properties.machineHomeX, MM)),
+                 "Y" + xyzFormat.format(toPreciseUnit(properties.machineHomeY, MM)));
       }
    else     // laser
       {
-      if (properties.UseZ)
+      xOutput.reset();
+      yOutput.reset();
+      if (properties.gotoMCSatend)    // go to MCS home
          {
-         if (OB.isLaser)
-            writeBlock( gAbsIncModal.format(90), gFormat.format(53),
-                        gMotionModal.format(0), zOutput.format(toPreciseUnit(properties.machineHomeZ, MM)) );
-         if (OB.isPlasma)
-            {
-            xOutput.reset();
-            yOutput.reset();
-            if (properties.gotoMCSatend)    // go to MCS home
-               {
-               writeBlock( gAbsIncModal.format(90), gFormat.format(53),
-                           gMotionModal.format(0),
-                           zOutput.format(toPreciseUnit(properties.machineHomeZ, MM)) );
-               writeBlock( gAbsIncModal.format(90), gFormat.format(53),
-                           gMotionModal.format(0),
-                           xOutput.format(toPreciseUnit(properties.machineHomeX, MM)),
-                           yOutput.format(toPreciseUnit(properties.machineHomeY, MM)) );
-               }
-            else
-               writeBlock(gMotionModal.format(0), xOutput.format(0), yOutput.format(0));
-            }
+         if (properties.UseZ)
+            writeBlock(  gFormat.format(53), gFormat.format(0), zOutput.format(toPreciseUnit(properties.machineHomeZ, MM)) );
+         writeBlock(  gFormat.format(53), gFormat.format(0),
+                     xOutput.format(toPreciseUnit(properties.machineHomeX, MM)),
+                     yOutput.format(toPreciseUnit(properties.machineHomeY, MM)) );
+         }
+      else
+         {
+         if (properties.UseZ)
+            writeBlock(  gFormat.format(53), gFormat.format(0), zOutput.format(toPreciseUnit(properties.machineHomeZ, MM)) );
+         writeBlock( gFormat.format(0), xOutput.format(0), yOutput.format(0));
          }
       }
    writeBlock(mFormat.format(30));  // Program End
    //writeln("%");                    // EndOfFile marker
    }
 
+/**
+ * Finalizes the output when multiple files are generated by creating a manifest file.
+ *
+ * This function is called once at the very end of the entire post-processing job.
+ * Its main purpose is to improve usability when the job is split into multiple
+ * G-code files (due to tool changes or line count limits).
+ *
+ * It performs the following steps for multi-file jobs:
+ * 1. It takes the first generated file (which has the base program name).
+ * 2. It copies this file to its final, numbered name (e.g., `program.01ofX.gcode`).
+ * 3. It deletes the original, un-numbered file.
+ * 4. It creates a new text file with the original program name (e.g., `program.gcode`)
+ *    that acts as a manifest, containing a list of all the numbered G-code files
+ *    that were created for the job.
+ *
+ * This leaves the user with a clear list of files to run on their machine,
+ * eliminating the ambiguity of which file to run first.
+ *
+ * @returns {void} This function does not return a value.
+ */
 function onTerminate()
    {
    // If we are generating multiple files, copy first file to add # of #
@@ -1991,6 +2453,28 @@ function onTerminate()
    //executeNoWait("start", "\"" + FileSystem.replaceExtension(outputPath, "html") + "\"", false, "");
    }
 
+/**
+ * Handles manual NC commands inserted into the CAM setup.
+ *
+ * This function acts as an event handler for specific, non-toolpath commands
+ * like "Program Stop", "Power On", or "Power Off". It translates these abstract
+ * commands from the CAM system into concrete G-code sequences.
+ *
+ * Key command translations include:
+ * - `COMMAND_STOP`: Issues a program stop (M0).
+ * - `COMMAND_POWER_OFF`: Sets the internal power state to off and issues an M5
+ *   command, with an optional post-cut delay for plasma.
+ * - `COMMAND_POWER_ON`: This is the most complex handler. It sets the internal
+ *   power state to on. For plasma operations with touch-off enabled, it
+ *   generates a full probing cycle (G38.2) to find the material surface, sets
+ *   the work offset (G10 L20), and then moves to the pierce height. For other
+ *   laser/plasma operations, it moves to the pierce height before issuing the
+ *   M3 command to turn the beam/torch on.
+ *
+ * @param {Command} command The command constant from the post-processor API,
+ *   such as `COMMAND_STOP`, `COMMAND_POWER_ON`, etc.
+ * @returns {void} This function does not return a value.
+ */
 function onCommand(command)
    {
    if (debugMode) writeComment("onCommand " + command);
@@ -2031,6 +2515,7 @@ function onCommand(command)
                {
                if (properties.plasma_usetouchoff && OB.isPlasma)
                   {
+                  // probe for plasma touchoff
                   writeln("");
                   writeBlock( "G38.2", zOutput.format(toPreciseUnit(-plasma_probedistance, MM)), feedOutput.format(toPreciseUnit(plasma_proberate, MM)));
                   if (debugMode) writeComment("touch offset "  + xyzFormat.format(properties.plasma_touchoffOffset) );
@@ -2065,145 +2550,148 @@ function onCommand(command)
    if (debugMode) writeComment("onCommand end");
    }
 
+/**
+ * Handles specific CAM parameters passed during post-processing.
+ *
+ * This function is a critical event handler that is called by the post-processor
+ * engine whenever it encounters specific named parameters within an operation. It
+ * acts as a switchboard to capture and process settings that are not part of the
+ * standard toolpath data, such as heights, feed rates for special moves, and
+ * action triggers.
+ *
+ * Key responsibilities include:
+ * - Capturing essential height values like `retractHeight`, `clearanceHeight`, and `topHeight`.
+ * - Configuring parameters for plasma and laser operations, including `pierceTime`,
+ *   `cutHeight`, and `leadinRate`.
+ * - Setting up feed rates for probing cycles.
+ * - Executing special action sequences, most notably the "pierce" action, which
+ *   triggers a dwell followed by a plunge to the cutting height.
+ *
+ * @param {string} name The unique string identifier for the parameter, e.g.,
+ *   "operation:retractHeight value", "movement:lead_in", or "action".
+ * @param {*} value The value associated with the parameter, which can be a
+ *   number, string, or other type.
+ * @returns {void} This function does not return a value.
+ */
 function onParameter(name, value)
    {
-   //onParameter('operation:keepToolDown', 0)
-   //if (debugMode) writeComment("onParameter =" + name + "= " + value);   // (onParameter =operation:retractHeight value= :5)
-   name = name.replace(" ", "_"); // dratted indexOF cannot have spaces in it!
-   if ( (name.indexOf("retractHeight_value") >= 0 ) )   // == "operation:retractHeight value")
+   if (debugMode) writeComment("onParameter =" + name + "= " + value);
+   switch (name)
       {
-      retractHeight = value;
-      if (debugMode) writeComment("onparameter - retractHeight = " + round(retractHeight,3));
-      }
-   if (name.indexOf("operation:clearanceHeight_value") >= 0)
-      {
-      clearanceHeight = value;
-      if (debugMode) writeComment("onparameter - clearanceHeight = " + round(clearanceHeight,3));
-      }
+//2073: onParameter('operation:tool_feedCutting', 1270)
+      case "operation:tool_feedCutting" :
+         Feeds.cutting =  value;
+         break;  
+//2077: onParameter('operation:tool_feedEntry', 1270)
+      case "operation:tool_feedEntry" :
+         Feeds.entry =  value;
+         break;
+//2079: onParameter('operation:tool_feedExit', 1270)
+      case "operation:tool_feedExit" :
+         Feeds.exit =  value;
+         break;
+//2081: onParameter('operation:tool_feedTransition', 1270)
+//2083: onParameter('operation:tool_feedRamp', 635)
+//2085: onParameter('operation:tool_feedPlunge', 635)
+//2089: onParameter('operation:tool_feedRetract', 635)
 
-   if (name.indexOf("movement:lead_in") != -1)
-      {
-      // value is always mm so convert if needed   
-      //if (unit == IN)
+      case "operation:retractHeight_value":
+         Heights.retract = value;
+         if (debugMode) writeComment("onparameter - Heights.retract = " + round(Heights.retract, 3));
+         break;
+      case "operation:clearanceHeight_value":
+         Heights.clearance = value;
+         if (debugMode) writeComment("onparameter - Heights.clearance = " + round(Heights.clearance, 3));
+         break;
+      case "movement:lead_in":
          plasma.leadinRate = toPreciseUnit(value,MM);
-      //else
-      //   plasma.leadinRate = value;
-      if (debugMode && OB.isPlasma) writeComment("onparameter - leadinRate set " + round(plasma.leadinRate,1) + " unit " + unit);
-      }
-
-   if (name.indexOf("operation:topHeight_value") >= 0)
-      {
-      topHeight = value;
-      if (debugMode && OB.isPlasma) writeComment("onparameter - topHeight set " + topHeight);
-      }
-   if (name.indexOf('operation:cuttingMode') >= 0)
-      {
-      OB.cuttingMode = value;
-      if (debugMode) writeComment("onparameter - cuttingMode set " + OB.cuttingMode);
-      if (OB.cuttingMode.indexOf('cut') >= 0) // simplify later logic, auto/low/medium/high are all 'cut'
-         OB.cuttingMode = 'cut';
-      if (OB.cuttingMode.indexOf('auto') >= 0)
-         OB.cuttingMode = 'cut';
-      }
-
-   if (name.indexOf("operation:tool_cutHeight") >= 0)
-      {
-         // todo decide which of topheight or cutHeight to use for plasma - which one is set first?  topHeight
-      //if (value == 0)   cannot be 0, tool edit wont let you
-      var msg = '';
-      if (topHeight != 0)
-         {
-         plasma.cutHeight = topHeight;
-         msg = ' = topHeight';
-         plasma.mode = 1;
-         }
-      else
-         {
-         if (OB.isPlasma)   
+         if (debugMode && OB.isPlasma) writeComment("onparameter - leadinRate set " + round(plasma.leadinRate,1) + " unit " + unit);
+         break;
+      case "operation:topHeight_value":
+         Heights.top = value;
+         if (debugMode && OB.isPlasma) writeComment("onparameter - Heights.top set " + Heights.top);
+         break;
+      case "operation:cuttingMode":
+         OB.cuttingMode = value;
+         if (debugMode) writeComment("onparameter - cuttingMode set " + OB.cuttingMode);
+         if (OB.cuttingMode.indexOf('cut') >= 0) // simplify later logic, auto/low/medium/high are all 'cut'
+            OB.cuttingMode = 'cut';
+         if (OB.cuttingMode.indexOf('auto') >= 0)
+            OB.cuttingMode = 'cut';
+         break;
+      case "operation:tool_cutHeight": // laser
+         var msg = '';
+         if (Heights.top != 0)
             {
-            plasma.cutHeight =  value; 
-            msg = ' = tool.cutHeight';
+            plasma.cutHeight = Heights.top;
+            msg = ' = Heights.top';
+            plasma.mode = 1;
             }
-         else   
+         else
             {
-            plasma.cutHeight =  0; // laser cut height is always 0
-            msg = ' =0_for_laser';  
-            }             
-         plasma.mode = 2;
-         }
-      if (debugMode) writeComment("onparameter - cutHeight set " + plasma.cutHeight + msg);
-      }
-   if (name.indexOf("operation:tool_pierceTime") >= 0)
-      {
-      msg = ' = tool_pierceTime';   
-      if (properties.spindleOnOffDelay > 0)
-         {
-         plasma.pierceTime = properties.spindleOnOffDelay;
-         msg = ' = spindleonoffdelay';
-         }
-      else
-         plasma.pierceTime = value;
-      if (debugMode) writeComment("onparameter - pierceTime set " + plasma.pierceTime + msg);
-      }
-               
-   // (onParameter =operation:pierceClearance= 1.5)    for plasma
-   // if (name == 'operation:pierceClearance')
-   //    {
-   //    if (properties.plasma_pierceHeightoverride)
-   //       plasma_pierceHeight = properties.plasma_pierceHeightValue;
-   //    else
-   //       {
-   //       var sectionId = getCurrentSectionId();       // what is the number of this operation (starts from 0)
-   //       if (sectionId > -1)
-   //          {
-   //          writeComment("sectionid " + sectionId);
-   //          var section = getSection(sectionId);         // what is the section-object for this operation
-   //          var tool = section.getTool();                // get the tool
-   //          plasma_pierceHeight = tool.pierceHeight; // NOT pierceClearance!
-   //          writeComment('onparameter pierceHeight ' + plasma_pierceHeight );
-   //          }
-   //       }
-   //    }
-   if ((name == 'action') && (value == 'pierce'))
-      {
-      if (OB.isLaser && !properties.UsePierce)
-         return;
-      if (debugMode) writeComment('action pierce');
-      onDwell(plasma.pierceTime);
-      if (properties.UseZ) // done a probe and/or pierce, now lower to cut height
-         {
-         if (OB.isPlasma) 
-            zOutput.reset();
-         var _zz = zOutput.format(plasma.cutHeight);
-         if (_zz)
-            {
-            if (debugMode) writeComment('lower to cutheight');
-            writeBlock( gMotionModal.format(1), _zz, feedOutput.format(plasma.leadinRate) );
-            gMotionModal.reset();
+            if (OB.isPlasma)
+               {
+               plasma.cutHeight =  value;
+               msg = ' = tool.cutHeight';
+               }
+            else
+               {
+               plasma.cutHeight =  0; // laser cut height is always 0
+               msg = ' =0_for_laser';
+               }
+            plasma.mode = 2;
             }
-         }
-      if (debugMode) writeComment('action pierce done');
-      }
-   if (name == 'operation:tool_feedProbeLink')
-      {
-      PRB.feedProbeLink = value;
-      if (debugMode) writeComment("onparameter - feedProbeLink set " + PRB.feedProbeLink);
-      }
-   if (name == 'operation:tool_feedProbeMeasure')
-      {
-      PRB.feedProbeMeasure = value;   
-      if (debugMode) writeComment("onparameter - feedProbeMeasure set " + PRB.feedProbeMeasure);
-      }
-   if (name == 'operation:probeWorkOffset')
-      {
-      //writeComment('override wcs ' + value)   ;
-      if (value > 0)
-         warning("WARNING " + 'You set a probe *Overide Driving WCS* but I dont know how to do that yet');   
-      }
-   if (name == 'probe-output-work-offset')
-      {
-      PRB.probe_output_work_offset = value;
-      if (debugMode) writeComment("onparameter - probe_output_work_offset set " + PRB.probe_output_work_offset);
+         if (debugMode) writeComment("onparameter - cutHeight set " + plasma.cutHeight + msg);
+         break;
+      case "operation:tool_pierceTime": //laser
+         msg = ' = tool_pierceTime';
+         if (properties.spindleOnOffDelay > 0)
+            {
+            plasma.pierceTime = properties.spindleOnOffDelay;
+            msg = ' = spindleonoffdelay';
+            }
+         else
+            plasma.pierceTime = value;
+         if (debugMode) writeComment("onparameter - pierceTime set " + plasma.pierceTime + msg);
+         break;
+      case "action": //plasma/laser
+         if (value == 'pierce')
+            {
+            if (OB.isLaser && !properties.UsePierce)
+               return;
+            if (debugMode) writeComment('action pierce');
+            onDwell(plasma.pierceTime);
+            if (properties.UseZ) // done a probe and/or pierce, now lower to cut height
+               {
+               if (OB.isPlasma)
+                  zOutput.reset();
+               var _zz = zOutput.format(plasma.cutHeight);
+               if (_zz)
+                  {
+                  if (debugMode) writeComment('lower to cutheight');
+                  writeBlock( gMotionModal.format(1), _zz, feedOutput.format(plasma.leadinRate) );
+                  gMotionModal.reset();
+                  }
+               }
+            if (debugMode) writeComment('action pierce done');
+            }
+         break;
+      case "operation:tool_feedProbeLink":
+         PRB.feedProbeLink = value;
+         if (debugMode) writeComment("onparameter - feedProbeLink set " + PRB.feedProbeLink);
+         break;
+      case "operation:tool_feedProbeMeasure":
+         PRB.feedProbeMeasure = value;
+         if (debugMode) writeComment("onparameter - feedProbeMeasure set " + PRB.feedProbeMeasure);
+         break;
+      case "operation:probeWorkOffset":
+         if (value > 0)
+            warning("WARNING " + 'You set a probe *Overide Driving WCS* but I dont know how to do that yet');
+         break;
+      case "probe-output-work-offset":
+         PRB.probe_output_work_offset = value;
+         if (debugMode) writeComment("onparameter - probe_output_work_offset set " + PRB.probe_output_work_offset);
+         break;
       }
    }
 
@@ -2218,8 +2706,30 @@ function toFixedNumber(num, digits, base)
    return Math.round(num * pow) / pow;
    }
 
-// set the coolant mode from the tool value
-// changed 2023 - returns a string rather than writing the block itself
+/**
+ * set the coolant mode from the tool value
+ * changed 2023 - returns a string rather than writing the block itself
+ *
+ * Translates a numeric coolant code into the corresponding G-code M-commands.
+ *
+ * This function takes a numeric code representing the desired coolant state, as
+ * defined in the Fusion 360 tool library, and returns a string with the
+ * appropriate M-code(s) to send to the GRBL controller.
+ *
+ * It maintains an internal state (`coolantIsOn`) to avoid sending redundant
+ * commands and to correctly handle transitions between different coolant types
+ * (e.g., turning off flood before turning on mist).
+ *
+ * The valid input codes are:
+ * - `0`: Coolant Off (M9)
+ * - `1`: Flood Coolant On (M8)
+ * - `2`: Mist Coolant On (M7)
+ * - `7`: Both Flood and Mist On (M8 M7)
+ *
+ * @param {number} coolval The numeric code for the desired coolant state.
+ * @returns {string} A string containing the required M-code(s) (e.g., "M8", "M9"),
+ *   or an empty string if no command is necessary.
+ */
 function setCoolant(coolval)
    {
    var cresult = '';
@@ -2300,7 +2810,36 @@ function onCycleEnd()
       }   
    }      
 
-// probe X from left or right
+/**
+ * probe X from left or right
+ *
+ * Generates G-code for a single-axis probing cycle along the X-axis.
+ *
+ * This function is called by `onCyclePoint` for the "probing-x" cycle. It performs
+ * a two-stage (fast, then slow) probe to accurately find the edge of a workpiece
+ * in the X direction and sets the work coordinate system accordingly.
+ *
+ * The probing direction (positive or negative X) is determined by the `cycle.approach1`
+ * property. The routine uses several other properties from the global `cycle` object,
+ * such as `probeClearance`, `probeOvertravel`, `depth`, and `feedrate`.
+ *
+ * The process is as follows:
+ * 1. Move to the initial Z height (`z`).
+ * 2. Switch to relative motion (G91).
+ * 3. Move down to the probing depth (`cycle.depth`).
+ * 4. Perform a fast probe (G38.2) towards the workpiece.
+ * 5. Retract slightly off the surface.
+ * 6. Perform a slower, more accurate re-probe.
+ * 7. Set the X-axis of the current work offset (G10 L20), compensating for the tool radius.
+ * 8. Retract away from the workpiece.
+ * 9. Switch back to absolute motion (G90).
+ * 10. Return to the initial X and Z coordinates.
+ *
+ * @param {number} x The initial X-coordinate for the cycle point.
+ * @param {number} y The initial Y-coordinate for the cycle point (used for positioning).
+ * @param {number} z The retract Z-coordinate for the cycle.
+ * @returns {void}
+ */
 function probeX(x,y,z)
    {
       var dir = 0;
@@ -2308,11 +2847,11 @@ function probeX(x,y,z)
    writeComment('probeX : ' + x + " " + y + " " + z);   
    switch(cycle.approach1) 
       {
-      case "positive":  // probing +Y toward stock
+      case "positive":  // probing +X toward stock
          writeComment('probe X positive');
          dir = 1;
          break;
-      case "negative": /// probing -y toward stock
+      case "negative": /// probing -X toward stock
          writeComment('probe X negative');
          dir = -1;
          break;
@@ -2347,8 +2886,16 @@ function probeX(x,y,z)
    writeComment('probeX finished');
    }   
 
+/**
+ * same as for X, but for Y
+* @param {number} x The initial X-coordinate for the cycle point.
+* @param {number} y The initial Y-coordinate for the cycle point.
+* @param {number} z The retract Z-coordinate for the cycle.
+* @returns {void}
+*/
 function probeY(x,y,z)
-   {        //move to Y-cycle.probeClearance   feedrate(tool_feedProbeLink)
+   {
+   //move to Y-cycle.probeClearance   feedrate(tool_feedProbeLink)
       var dir = 0;
 
    writeComment('probeY : ' + x + " " + y + " " + z);   
@@ -2393,7 +2940,14 @@ function probeY(x,y,z)
    writeComment('probeY finished');
    }
 
-// probe Z - always negative?
+/**
+ * same as for X and Y but for Z
+ * alsways probes in negative direction
+ * @param {number} x The initial X-coordinate for the cycle point.
+ * @param {number} y The initial Y-coordinate for the cycle point.
+ * @param {number} z The retract Z-coordinate for the cycle.
+ * @returns {void}
+ */
 function probeZ(x,y,z)   
    {
    writeComment('probeZ: ' + x + " " + y + " " + z);         
@@ -2423,9 +2977,33 @@ function probeZ(x,y,z)
    writeComment('probe Z end');
    }
 
-   /*
-      handle sprobe operations since there are many of them and only some can be supported on BlackBox 4X
-      Remember to expand unsupported cycles
+/**
+ * Main event handler for canned cycles, routing them to the appropriate G-code generation logic.
+ *
+ * This function is called for each point within a canned cycle (e.g., each hole in a
+ * drilling pattern or each point in a probing routine). It acts as a central switchboard,
+ * examining the global `cycleType` variable to determine how to process the provided
+ * coordinates.
+ *
+ * It provides custom implementations for specific cycles supported by this post-processor,
+ * including:
+ * - Single-axis probing (`probing-x`, `probing-y`, `probing-z`).
+ * - XY outer corner probing (`probing-xy-outer-corner`).
+ * - Counter-boring (`counter-boring`), with specific handling for the dwell time.
+ *
+ * For recognized but unsupported cycles, it issues a warning to the user.
+ *
+ * For all other standard cycles (like drilling, tapping, etc.), it delegates to the
+ * `expandCyclePoint` function, which translates the cycle into a series of basic
+ * G0 and G1 linear moves. This ensures broad compatibility for drilling operations.
+ * 
+ * handles probe operations since there are many of them and only some can be supported on BlackBox 4X
+ * Remember to expand unsupported cycles which will handle drilling cycles for us.
+ *
+ * @param {number} x The X-coordinate of the current cycle point (e.g., center of a hole).
+ * @param {number} y The Y-coordinate of the current cycle point.
+ * @param {number} z The Z-coordinate representing the bottom of the hole or final depth.
+ * @returns {void} This function does not return a value.
    */
 function onCyclePoint(x, y, z)
    {
@@ -2532,7 +3110,7 @@ function onCyclePoint(x, y, z)
          var feed = feedOutput.format(cycle.feedrate);
          if (debugMode) writeComment('counter-boring cycle '+_x+_y+_z + dwell+feed);
          writeBlock(gMotionModal.format(0), _x,_y);   // G0 to xy
-         writeBlock(gMotionModal.format(0), hret);    // G0 to retractheight
+         writeBlock(gMotionModal.format(0), hret);    // G0 to Heights.retract
          writeBlock(gMotionModal.format(1),_z,feed);  // G1 to drill depth
          if (cycle.dwell > 0)
             onDwell(cycle.dwell);
@@ -2545,3 +3123,60 @@ function onCyclePoint(x, y, z)
       }
    }
 
+/// set mill to true and isplasma & islaser to false
+function setMill()
+   {
+   OB.isMill = true;
+   OB.isPlasma = OB.isLaser = false;
+   }
+
+/// set laser
+function setLaser()
+   {
+   OB.isLaser = true;
+   OB.isPlasma = OB.isMill = false;
+   }
+
+/// set plasma
+function setPlasma()
+   {
+   OB.isPlasma = true;
+   OB.isMill = OB.isLaser = false;
+   }
+
+/**
+ * Sets the global operation type flags (OB.isMill, OB.isLaser, OB.isPlasma)
+ * based on the provided tool's type. This function centralizes the logic for
+ * identifying the nature of the current CAM operation.
+ *
+ * @param {object} tool The Fusion 360 tool object for the current operation.
+ * @returns {void}
+ */
+function setOperationType(tool) 
+   {
+   switch (tool.type) 
+      {
+      case TOOL_LASER_CUTTER:
+         setLaser();
+         break;
+      case TOOL_WATER_JET:
+      case TOOL_PLASMA_CUTTER:
+         setPlasma();
+         break;
+      default: // Includes TOOL_PROBE and all milling tools
+         setMill();
+         break;
+      }
+   }
+
+/*
+   true if NEAR greater or equal to target. 
+   true if val >= target - 0.1MM        saves us doing the math in many places   
+   @PARAM val the value
+   @PARAM target the target height
+*/
+function nearGE(val, target)
+   {
+   target = target - toPreciseUnit(0.1,MM);      
+   return val >= target;
+   }
