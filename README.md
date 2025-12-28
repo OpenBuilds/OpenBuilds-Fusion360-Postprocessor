@@ -3,6 +3,16 @@
 Creates .gcode files optimized for GRBL/grblHAL based Openbuilds-style machines.
 Supports router, laser and plasma operations.
 
+V1.0.46
+1. wcs handling on sections : G54..59 will be output if it changed between sections, 
+   mostly handles multiple WCS outputs for patterns
+1. plasma arcs : arcs for plasma cutting improved for small kerf widths
+1. direct moves : better detection of 'long enough' direct moves
+1. linesplit feedrate on reentry : reentry was a long plunge at plunge rate, now a rapid to 'Top' height followed
+   by a feed at lead-in rate to the previous cut height.  
+   Since most linesplits are now on rapid moves this is efficient and safe.
+1. Displays total machining time in header
+
 V1.0.45
 1. Added code documentation using Gemini Code Assist AI.
 1. Optimized rapids in adaptive clearing, for best effect make sure that the Lead-In feedrate is slightly lower than the Cutting feedrate on the Linking tab.

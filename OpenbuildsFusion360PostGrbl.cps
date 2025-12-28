@@ -57,8 +57,9 @@
    xx Oct 2024 - V1.0.43 : fix plasma pierce/cut height, pierceTime so it uses the tool settings if provided
    10 Aug 2025 - V1.0.44 : fix movement ordering and other tweaks, see readme.md
    17 Aug 2025 - V1.0.45 : docs, refactored, new speed handling in adaptives, see README for details
+   25 Dec 2025 - V1.0.46 : wcs handling on sections, plasma arcs, direct moves, linesplit feedrate on reentry, total machining time in header
 */
-obversion = 'V1.0.45';
+obversion = 'V1.0.46';
 description = "OpenBuilds CNC : GRBL/BlackBox";  // cannot have brackets in comments
 longDescription = description + " : Post " + obversion; // adds description to post library dialog box
 vendor = "OpenBuilds";
@@ -338,7 +339,7 @@ var minimumFeedRate = toPreciseUnit(45, MM); // GRBL lower limit in mm/minute
 var fileIndexFormat = createFormat({width: 2, zeropad: true, decimals: 0});
 var isNewfile = false;  // set true when a new file has just been started
 
-// group our private variables together to Autodesk does not break us when they make something into a property
+// group our private variables together so Autodesk does not break us when they make something into a property
 var OB = {
    power : 0,           // the setpower value, for S word when laser/plasma cutting
    powerOn : false,     // is the laser power on? used for laser when haveRapid=false
@@ -392,7 +393,7 @@ var plasma = {
 var linmove = 1;           // linear move mode
 var toolRadius;            // for arc linearization
 var coolantIsOn = 0;       // set when coolant is used to we can do intelligent turn off
-var currentworkOffset = 54;// the current WCS in use, so we can retract Z between sections if needed
+var currentworkOffset = 0; // the current WCS in use, so we can retract Z between sections if needed
 var clnt = '';             // coolant code to add to spindle line
 
 var PRB = {
@@ -579,20 +580,20 @@ function rpm2dial(rpm, op)
    if (isProbeOperation())      
       return 1;
 
-   if (properties.routerType == "Dewalt")
-      {
-      var speeds = [0, 16000, 18200, 20400, 22600, 24800, 27000];
-      }
-   else
-      if (properties.routerType == "Router11")
-         {
-         var speeds = [0, 10000, 14000, 18000, 23000, 27000, 32000];
-         }
-      else
-         {
+   var speeds;
+   switch (properties.routerType) {
+      case "Dewalt":
+         speeds = [0, 16000, 18200, 20400, 22600, 24800, 27000];
+         break;
+      case "Router11":
+         speeds = [0, 10000, 14000, 18000, 23000, 27000, 32000];
+         break;
+      case "Makita":
+      default:
          // this is Makita R0701 and default for 'other'
-         var speeds = [0, 10000, 12000, 17000, 22000, 27000, 30000];
-         }
+         speeds = [0, 10000, 12000, 17000, 22000, 27000, 30000];
+         break;
+   }
 
    if (rpm < speeds[1])
       {
@@ -665,10 +666,10 @@ function checkMinFeedrate(section, op)
       }
    }
 
-   /**
-    * write a block of gcode
-    * counts lines if tapelines is set
-    */
+/**
+ * write a block of gcode
+ * counts lines if tapelines is set
+ */
 function writeBlock()
    {
    writeWords(arguments);
@@ -726,17 +727,28 @@ function formatComment(text)
    }
 
 /**
+ * return seconds as a h:m:s string
+ * @param secs seconds of time
+ */
+function getTimeText(secs)
+   {
+   var machineTimeInSeconds = secs;
+   var machineTimeHours = Math.floor(machineTimeInSeconds / 3600);
+   machineTimeInSeconds = machineTimeInSeconds % 3600;               // remove the hours
+   var machineTimeMinutes = Math.floor(machineTimeInSeconds / 60);
+   var machineTimeSeconds = Math.floor(machineTimeInSeconds % 60);   // remove the minutes
+   var machineTimeText = subst(localize("%1h:%2m:%3s"), machineTimeHours, machineTimeMinutes, machineTimeSeconds);
+   return machineTimeText;
+   }
+
+/**
  * returns the time as 'machining time 00h00m00s'
  */
 function getMachineTime(sec)
    {
    var machineTimeInSeconds = sec.getCycleTime();
-   var machineTimeHours = Math.floor(machineTimeInSeconds / 3600);
-   machineTimeInSeconds = machineTimeInSeconds % 3600;               // remove the hours
-   var machineTimeMinutes = Math.floor(machineTimeInSeconds / 60);
-   var machineTimeSeconds = Math.floor(machineTimeInSeconds % 60);   // remove the minutes
-   var machineTimeText = "  Machining time : ";
-   machineTimeText += subst(localize("%1h:%2m:%3s"), machineTimeHours, machineTimeMinutes, machineTimeSeconds);
+   var machineTimeText = "  Machining time : ";   
+   machineTimeText += getTimeText(machineTimeInSeconds);
    return machineTimeText;
    }   
 
@@ -847,7 +859,19 @@ function writeHeader(secID)
       {
       writeComment("Program Comments : " + programComment);
       }
+   // output stock size
+   var xl = getGlobalParameter('stock-lower-x');
+   var yl = getGlobalParameter('stock-lower-y');
+   var xu = getGlobalParameter('stock-upper-x');
+   var yu = getGlobalParameter('stock-upper-y');
+   var zl = getGlobalParameter('stock-lower-z');
+   var zu = getGlobalParameter('stock-upper-z');
+   var xs = xu - xl;
+   var ys = yu - yl;
+   var zs = zu - zl;
+   writeComment("Stock : XxYxZ : " + xs.toPrecision(2) + "x" + ys.toPrecision(2)  + "x" + zs.toPrecision(2) )  
    writeln("");
+
    numberOfSections = getNumberOfSections();
    if (properties.generateMultiple && filesToGenerate > 1)
       {
@@ -878,7 +902,7 @@ function writeHeader(secID)
       {
       writeComment(numberOfSections + " Operation" + ((numberOfSections == 1) ? "" : "s") + " :");
       }
-
+   var totalSeconds = 0;
    for (var i = secID; i < numberOfSections; ++i)
       {
       var section = getSection(i);
@@ -951,6 +975,7 @@ function writeHeader(secID)
       if (section.strategy != 'probe')
          checkMinFeedrate(section, op);
       machineTimeText = getMachineTime(section);
+      totalSeconds += section.getCycleTime();
       writeComment(machineTimeText);
 
       if (properties.generateMultiple && (i + 1 < numberOfSections))
@@ -963,6 +988,9 @@ function writeHeader(secID)
             }
          }
       }
+   machineTimeText = "Total Machining time : " + getTimeText(totalSeconds);
+   writeComment(machineTimeText);
+   writeln("");
 
    // Restore the OB state to be correct for the current tool. The loop above
    // will have left the state set for the *last* tool in the entire job.
@@ -1226,7 +1254,8 @@ function writeZretract()
    zOutput.reset();
    gMotionModal.reset();
    //gFormat.reset();
-   writeln("(This relies on homing, see https://openbuilds.com/search/127200199/?q=G53+fusion )");
+   //writeln("(This relies on homing, see https://openbuilds.com/search/127200199/?q=G53+fusion )");
+   writeln("(This relies on homing, see https://github.com/OpenBuilds/OpenBuilds-Fusion360-Postprocessor/wiki/FAQ)");
    writeBlock(gFormat.format(53), gMotionModal.format(0), zOutput.format(toPreciseUnit( properties.machineHomeZ, MM)));  // Retract spindle to Machine Z Home
    gMotionModal.reset();
    zOutput.reset();
@@ -1302,7 +1331,8 @@ function onSection()
    if (OB.isLaser || OB.isPlasma)
       {
       // fake the radius larger else the arcs are too small before being linearized since kerfwidth is very small compared to normal tools
-      toolRadius = tool.kerfWidth * 3;
+      if (tool.kerfWidth < toPreciseUnit(2,MM))
+         toolRadius = tool.kerfWidth * 3;
       allowHelicalMoves = false; // laser/plasma not doing this, ever
       }
    else
@@ -1364,7 +1394,7 @@ function onSection()
    if (debugMode)
       writeComment("Heights.retract = " + round(Heights.retract, 3));
 
-   // retract again if no first section and WCS changed
+   // retract again if not first section and WCS changed
    if (!isFirstSection() && (currentworkOffset !=  (53 + section.workOffset)) )
       {
       writeZretract();
@@ -1382,8 +1412,11 @@ function onSection()
    else
       {
       // Write the WCS, ie. G54 or higher.. default to WCS1 / G54 if no or invalid WCS
-      currentworkOffset = 53 + section.workOffset;
-      writeBlock(gWCSOutput.format(currentworkOffset));  // use the selected WCS
+      if ( (53+section.workOffset) != currentworkOffset)
+         {
+         currentworkOffset = 53 + section.workOffset;
+         writeBlock(gWCSOutput.format(currentworkOffset));  // use the selected WCS
+         }
       }
    writeBlock(gAbsIncModal.format(90));  // Set to absolute coordinates
 
@@ -1646,6 +1679,7 @@ function onRapid(_x, _y, _z)
    {
    if (debugMode) writeComment("onRapid " + OB.haveRapid);      
    OB.haveRapid = true;
+   gMotionModal.reset(); // want G word for rapids
    //if (debugMode) writeComment("onRapid");
    if (OB.isMill)
       {
@@ -1656,6 +1690,7 @@ function onRapid(_x, _y, _z)
       if (x || y || z)
          {
          linmode = 0;
+         //writeBlock(gMotionModal.format(0), x, y, z, " ; Rapid move " , OB.movestr);
          writeBlock(gMotionModal.format(0), x, y, z);
          feedOutput.reset();
          }
@@ -1704,7 +1739,7 @@ function onRapid(_x, _y, _z)
 */
 function onLinear(_x, _y, _z, feed)
    {
-   if (debugMode) writeComment("onLinear " + OB.haveRapid + " ismill " + OB.isMill);
+   //writeComment("onLinear " + OB.haveRapid + " ismill " + OB.isMill);
    if (OB.powerOn || OB.haveRapid)   // do not reset if power is off - for laser G0 moves
       {
       xOutput.reset();
@@ -1722,20 +1757,32 @@ function onLinear(_x, _y, _z, feed)
       // For milling, a move to or above Heights.retract is a rapid move (if not in a rapid cycle)
       //if (debugMode) 
       if (!OB.haveRapid && nearGE(_z , Heights.retract) )
-         isRapidMove = true;
-      // a direct move is rapid, used in adaptive clearing   
-      if (OB.movestr == 'direct')  
          {
-         //writeComment('direct to rapid');
-         var start = getCurrentPosition();
-         var end = new Vector(_x, _y, _z);
-         // only if a longer move than toolRadius
-         if (Vector.diff(start, end).length > toolRadius)
-            isRapidMove = true; 
+         isRapidMove = true;
+         //if (debugMode) writeComment('1728 israpid');
          }
-      if (Feeds.cutting != Feeds.entry) // forces presense of leadin moves which we need
-         if ((OB.movestrP == 'lead out') && (OB.movestr == 'cutting'))
-            isRapidMove = true;
+      else   
+         // a direct move is rapid, used in adaptive clearing   
+         if (OB.movestr == 'direct')  
+            {
+            //if (debugMode) writeComment('1733 direct to rapid');
+            var start = getCurrentPosition();
+            var end = new Vector(_x, _y, _z);
+            end.setZ(start.z);    // ignore Z motion
+            // only if a longer horizontal move than toolRadius
+            if (Vector.diff(start, end).length > toolRadius)
+               {
+               isRapidMove = true; 
+               if (debugMode) writeComment('1742 vectordiff rapid');
+               }
+            }
+         else
+            if (Feeds.cutting != Feeds.entry) // forces presense of leadin moves which we need
+               if ((OB.movestrP == 'lead out') && (OB.movestr == 'cutting'))
+                  {
+                  isRapidMove = true;
+                  if (debugMode) writeComment('1750 leadout to rapid');
+                  }
       }
    else
       {
@@ -1744,7 +1791,11 @@ function onLinear(_x, _y, _z, feed)
       }
    linmove  = isRapidMove ? 0 : 1;
    if (isRapidMove)
+      {
       gMotionModal.reset(); // want G word for rapids
+      feedOutput.reset();
+      f = "";
+      }
 
    if (OB.isMill)
       {
@@ -1823,8 +1874,8 @@ function onLinear5D(_x, _y, _z, _a, _b, _c, feed)
    through two given points in a 2D plane.
 
    Original doc
-   this code was generated with the help of ChatGPT AI
-   calculate the centers for the 2 circles passing through both points at the given radius
+   This code was generated with the help of ChatGPT AI
+   Calculate the centers for the 2 circles passing through both points at the given radius
    if you ask chatgpt that ^^^ you will get incorrect code!
    if error then returns -9.9375 for all coordinates
    define points as var point1 = { x: 0, y: 0 };
@@ -2041,13 +2092,10 @@ function handleFileSplitting(x, y, z, feed, isRapid)
       var forceSplit = SPL.linecnt > (SPL.tapelines * 1.1);
       if (isRapid || forceSplit)
          {
-         if (debugMode)
-            {
-            if (forceSplit)
-               writeComment('Forcing split: line count (' + SPL.linecnt + ') > 110% of limit (' + Math.round(SPL.tapelines * 1.1) + ').');
-            else
-               writeComment('Tapelines ' + SPL.tapelines + ' exceeded. Splitting file at rapid move.');
-            }
+         if (forceSplit)
+            writeComment('Forcing split: line count (' + SPL.linecnt + ') > 110% of limit (' + Math.round(SPL.tapelines * 1.1) + ').');
+         else
+            writeComment('Tapelines ' + SPL.tapelines + ' exceeded. Splitting file at rapid move.');
          SPL.linecnt = 0;
          splitHere(x, y, z, feed);
          return true; // A split occurred
@@ -2250,9 +2298,12 @@ function splitHere(_x,_y,_z,_f)
    // goto z
    var sectionId = getCurrentSectionId();       // what is the number of this operation (starts from 0)
    var section = getSection(sectionId);         // what is the section-object for this operation
-   var feed = section.getParameter("operation:tool_feedPlunge");
+   var feed = section.getParameter("operation:tool_feedEntry"); // lead-in rate
    writeComment("Resume previous cut depth");
-   onLinear(_x,_y,_z,feed);  // feed back to previous cut level at plunge rate
+   gMotionModal.reset();
+   invokeOnRapid(_x,_y,Heights.top);  // feed back to top as rapid
+   haveRapid = false;
+   onLinear(_x,_y,_z,feed);  // feed back to previous cut level at lead-in rate
    }   
 
 /**
@@ -2417,7 +2468,7 @@ function onTerminate()
       }
    // from haas nextgen post, auto output a setup sheet
 /*   
-   this does not work as we cannot find the post in th epersonal post folder unless user tells us what it is
+   this does not work as we cannot find the post in the personal post folder unless user tells us what it is
    //var outputPath = getOutputPath();
    warning("outputpath " + outputPath);
    
@@ -2575,7 +2626,7 @@ function onCommand(command)
  */
 function onParameter(name, value)
    {
-   if (debugMode) writeComment("onParameter =" + name + "= " + value);
+   //if (debugMode) writeComment("onParameter =" + name + "= " + value);
    switch (name)
       {
 //2073: onParameter('operation:tool_feedCutting', 1270)
@@ -2605,11 +2656,11 @@ function onParameter(name, value)
          break;
       case "movement:lead_in":
          plasma.leadinRate = toPreciseUnit(value,MM);
-         if (debugMode && OB.isPlasma) writeComment("onparameter - leadinRate set " + round(plasma.leadinRate,1) + " unit " + unit);
+         if (debugMode) writeComment("onparameter - leadinRate set " + round(plasma.leadinRate,1) + " unit " + unit);
          break;
       case "operation:topHeight_value":
          Heights.top = value;
-         if (debugMode && OB.isPlasma) writeComment("onparameter - Heights.top set " + Heights.top);
+         if (debugMode) writeComment("onparameter - Heights.top set " + Heights.top);
          break;
       case "operation:cuttingMode":
          OB.cuttingMode = value;
@@ -2888,10 +2939,10 @@ function probeX(x,y,z)
 
 /**
  * same as for X, but for Y
-* @param {number} x The initial X-coordinate for the cycle point.
-* @param {number} y The initial Y-coordinate for the cycle point.
-* @param {number} z The retract Z-coordinate for the cycle.
-* @returns {void}
+ * @param {number} x The initial X-coordinate for the cycle point.
+ * @param {number} y The initial Y-coordinate for the cycle point.
+ * @param {number} z The retract Z-coordinate for the cycle.
+ * @returns {void}
 */
 function probeY(x,y,z)
    {
@@ -2942,7 +2993,7 @@ function probeY(x,y,z)
 
 /**
  * same as for X and Y but for Z
- * alsways probes in negative direction
+ * always probes in negative direction
  * @param {number} x The initial X-coordinate for the cycle point.
  * @param {number} y The initial Y-coordinate for the cycle point.
  * @param {number} z The retract Z-coordinate for the cycle.
@@ -3004,7 +3055,7 @@ function probeZ(x,y,z)
  * @param {number} y The Y-coordinate of the current cycle point.
  * @param {number} z The Z-coordinate representing the bottom of the hole or final depth.
  * @returns {void} This function does not return a value.
-   */
+ */
 function onCyclePoint(x, y, z)
    {
    if (debugMode) writeComment('onCyclePoint: ' + x + " " + y + " " + z);
@@ -3098,7 +3149,7 @@ function onCyclePoint(x, y, z)
          writeComment('probing-y-channel-with-island');
          warning(cycleType + ' not supported in this version');
          break;
-      case "counter-boring"   :  // counterbore with dwell - the expansion does not print the P word with milliseconds
+      case "counter-boring"   :  // counterbore with dwell - the expansion does not print the P word with seconds
          writeComment('Counterboring');
          var _x = xOutput.format(x);
          var _y = yOutput.format(y);
@@ -3109,16 +3160,22 @@ function onCyclePoint(x, y, z)
          var dwell = "P" + secFormat.format(cycle.dwell);  // dwell length in seconds
          var feed = feedOutput.format(cycle.feedrate);
          if (debugMode) writeComment('counter-boring cycle '+_x+_y+_z + dwell+feed);
-         writeBlock(gMotionModal.format(0), _x,_y);   // G0 to xy
-         writeBlock(gMotionModal.format(0), hret);    // G0 to Heights.retract
+         if (_x || _y)
+            writeBlock(gFormat.format(0), _x,_y);   // G0 to xy
+         if (hret)
+            writeBlock(gFormat.format(0), hret);    // G0 to Heights.retract
+         
          writeBlock(gMotionModal.format(1),_z,feed);  // G1 to drill depth
          if (cycle.dwell > 0)
             onDwell(cycle.dwell);
+         
          writeBlock(gMotionModal.format(0), hclr);    // G0 to clearance height
+         writeComment('Counterbore end');
          break;
       default:
-         if (debugMode) writeComment('Expanding cycle ' + cycleType);
+         writeComment('Expanding cycle ' + cycleType);
          expandCyclePoint(x, y, z);
+         writeComment('Expanding cycle end');
          return;
       }
    }
